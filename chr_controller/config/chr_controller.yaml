@@ -1,0 +1,36 @@
+chr_controller:
+  ros__parameters:
+    control_rate_hz: 100.0
+    feedback_timeout_s: 0.25
+    status_timeout_s: 1.50
+    target_timeout_s: 0.50
+
+    dls_damping: 0.03
+    dls_position_tolerance_m: 0.0005
+    dls_orientation_tolerance_rad: 0.01
+    dls_orientation_weight_m_per_rad: 0.25
+    dls_base_translation_scale: 0.35
+    dls_base_yaw_scale: 0.50
+    dls_maximum_step: 0.12
+    dls_maximum_iterations: 80
+    maximum_base_displacement_m: [0.30, 0.30, 0.18]
+    maximum_base_yaw_displacement_rad: 0.40
+    maximum_accepted_position_residual_m: 0.03
+    maximum_accepted_orientation_residual_rad: 0.15
+
+    joint_names: [J1, J2, J3]
+    joint_lower_rad: [-1.5708, 0.0, -1.5708]
+    joint_upper_rad: [1.5708, 0.5235987756, 1.5708]
+    maximum_joint_speed_rad_s: [0.35, 0.20, 0.35]
+
+    hover_linear_speed_threshold_m_s: 0.15
+    hover_angular_speed_threshold_rad_s: 0.20
+    hover_stable_duration_s: 3.0
+    maximum_base_command_speed_m_s: 0.15
+    maximum_yaw_command_speed_rad_s: 0.30
+    publish_velocity_feedforward: false
+    maximum_velocity_feedforward_m_s: 0.30
+    maximum_yawrate_feedforward_rad_s: 0.50
+
+    # Mid-air torque-off can make the hanging arm fall and disturb the aircraft.
+    allow_midair_torque_off: false

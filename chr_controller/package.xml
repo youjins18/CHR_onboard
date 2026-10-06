@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>chr_controller</name>
+  <version>0.1.0</version>
+  <description>Safety-gated whole-body DLS controller for the temporary CHR flight experiment.</description>
+  <maintainer email="chldbwls08@seoultech.ac.kr">youjins18</maintainer>
+  <author email="chldbwls08@seoultech.ac.kr">youjins18</author>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>eigen3_cmake_module</build_depend>
+  <depend>geometry_msgs</depend>
+  <depend>px4_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros2bag</exec_depend>
+  <exec_depend>rosbag2_storage_default_plugins</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,900 @@
+#include <chrono>
+#include <cmath>  
+#include <rclcpp/rclcpp.hpp>
+#include <eigen3/Eigen/Core>
+#include <eigen3/Eigen/Dense>
+
+#include <px4_msgs/msg/servo_angle.hpp>
+#include <px4_msgs/msg/servo_command.hpp>
+#include <px4_msgs/msg/wrench_command.hpp>
+#include <px4_msgs/msg/thrust_command.hpp>
+#include <px4_msgs/msg/actuator_servos.hpp>
+#include <px4_msgs/msg/vehicle_torque_non_norm.hpp>
+#include <px4_msgs/msg/vehicle_thrust_non_norm.hpp>
+#include <px4_msgs/msg/vehicle_acceleration.hpp>
+
+#include <px4_msgs/msg/vehicle_torque_setpoint.hpp>
+#include <px4_msgs/msg/vehicle_thrust_setpoint.hpp>
+#include <px4_msgs/msg/vehicle_odometry.hpp>
+#include <px4_msgs/msg/vehicle_local_position_setpoint.hpp>
+#include <px4_msgs/msg/vehicle_local_position.hpp>
+#include <px4_msgs/msg/actuator_motors.hpp>
+
+#include <px4_msgs/msg/custom_control_mode.hpp>
+#include <px4_msgs/msg/center_of_mass.hpp>
+#include <px4_msgs/msg/torque_dhat.hpp>
+#include <px4_msgs/msg/l1_adaptive_status.hpp>
+
+#include "std_msgs/msg/float32_multi_array.hpp"
+#include "std_msgs/msg/int32_multi_array.hpp"
+#include <px4_msgs/msg/vehicle_rates_setpoint.hpp>
+#include <px4_msgs/msg/vehicle_angular_velocity.hpp>
+#include <px4_msgs/msg/custom_dt.hpp>
+
+
+using namespace std::chrono_literals;
+
+std::chrono::duration<float> delta_t;
+
+//Timer------------------------------------------------
+auto end  =std::chrono::high_resolution_clock::now();
+auto start=std::chrono::high_resolution_clock::now();
+
+
+// ===== 2nd-order Butterworth LPF (DF2T) =====
+struct Biquad {
+    float b0{0.f}, b1{0.f}, b2{0.f}, a1{0.f}, a2{0.f};
+    float s1{0.f}, s2{0.f};
+
+    inline void setButter2Lowpass(float fc_Hz, float fs_Hz) {
+        // bilinear transform, pre-warp
+        const float PI_F = 3.14159265358979323846f;
+        const float K = tanf(PI_F * fc_Hz / fs_Hz);   // pre-warped
+        const float KK = K * K;
+        const float denom_inv = 1.f / (1.f + 1.41421356f * K + KK); // sqrt(2)=1.4142..
+
+        b0 = KK * denom_inv;
+        b1 = 2.f * b0;
+        b2 = b0;
+        a1 = 2.f * (KK - 1.f) * denom_inv;
+        a2 = (1.f - 1.41421356f * K + KK) * denom_inv;
+
+        // reset states
+        s1 = 0.f; s2 = 0.f;
+    }
+
+    inline float step(float x) {
+        // Direct Form II Transposed
+        const float y = b0 * x + s1;
+        s1 = b1 * x - a1 * y + s2;
+        s2 = b2 * x - a2 * y;
+        return y;
+    }
+};
+
+
+class ListenAndSpeakRos : public rclcpp::Node
+{
+public:
+        ListenAndSpeakRos() : Node("ListenAndSpeakRos")
+        {
+
+		
+		// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+                // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡQOS SETTINGㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+                // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+
+                rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
+                auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 6), qos_profile);
+
+
+		servo_lpf_fc_hz_ = this->declare_parameter<double>("servo_lpf_fc_hz", 8.0);
+		servo_lpf_fs_hz_ = this->declare_parameter<double>("servo_lpf_fs_hz", 100.0);
+
+
+		// 초기화
+		for (int i = 0; i < 5; ++i) {
+			lpf_th_[i].setButter2Lowpass(
+				static_cast<float>(servo_lpf_fc_hz_),
+				static_cast<float>(servo_lpf_fs_hz_));
+		}
+		lpf_inited_ = true;		
+
+		// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+                // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡPUBLISHERㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+                // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+
+
+		custom_control_mode_pub = this->create_publisher<px4_msgs::msg::CustomControlMode>("/fmu/in/custom_control_mode", 1);
+
+		servo_angle_px4_pub = this->create_publisher<px4_msgs::msg::ServoAngle>("/fmu/in/servo_angle", 10);
+		servo_angle_cmd_pub = this->create_publisher<std_msgs::msg::Float32MultiArray>("servo_angle_cmd", 1);
+
+		torque_command_pub  = this->create_publisher<std_msgs::msg::Float32MultiArray>("torque_cmd", 1);
+		force_command_pub  = this->create_publisher<std_msgs::msg::Float32MultiArray>("force_cmd", 1);
+		thrust_command_pub  = this->create_publisher<std_msgs::msg::Float32MultiArray>("thrust_cmd", 1);
+
+		data_logging_pub = this->create_publisher<std_msgs::msg::Float32MultiArray>("data_logging_msg", qos);
+
+
+		// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+		// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡSUBSCRIBERㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+		// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+
+		torque_command_sub = this->create_subscription<px4_msgs::msg::VehicleTorqueSetpoint>("/fmu/out/vehicle_torque_setpoint", qos,
+		[this](const px4_msgs::msg::VehicleTorqueSetpoint::UniquePtr msg) {
+	
+	// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+		tx = msg->xyz[0];
+		ty = msg->xyz[1];
+		tz = msg->xyz[2];
+		tz_trim = msg->yaw_trim;
+		});
+
+		force_command_sub = this->create_subscription<px4_msgs::msg::VehicleThrustSetpoint>("/fmu/out/vehicle_thrust_setpoint", qos,
+                [this](const px4_msgs::msg::VehicleThrustSetpoint::UniquePtr msg) {
+
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			fx = msg->xyz[0];
+    			fy = msg->xyz[1];
+			fz = msg->xyz[2];
+                });
+
+		thrust_command_sub = this->create_subscription<px4_msgs::msg::ThrustCommand>("/fmu/out/thrust_command", qos,
+                [this](const px4_msgs::msg::ThrustCommand::UniquePtr msg) {
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			
+			f1 = setThrustLimitation(msg->thrust_command[0]);
+			f2 = setThrustLimitation(msg->thrust_command[1]);
+			f3 = setThrustLimitation(msg->thrust_command[2]);
+			f4 = setThrustLimitation(msg->thrust_command[3]);
+                });
+
+		motor_command_sub = this->create_subscription<px4_msgs::msg::ActuatorMotors>("/fmu/out/actuator_motors", qos,
+                [this](const px4_msgs::msg::ActuatorMotors::UniquePtr msg) {
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+                        
+                        pwm1 = msg->control[0];
+                        pwm2 = msg->control[1];
+                        pwm3 = msg->control[2];
+                        pwm4 = msg->control[3];
+                        
+
+                });
+
+
+		vehicle_odometry_sub = this->create_subscription<px4_msgs::msg::VehicleOdometry>("/fmu/out/vehicle_odometry", qos,
+				
+                [this](const px4_msgs::msg::VehicleOdometry::UniquePtr msg) {
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			
+		
+			px = msg->position[0];
+			py = msg->position[1];
+			pz = msg->position[2];
+
+			vx = msg->velocity[0];
+			vy = msg->velocity[1];
+			vz = msg->velocity[2];
+
+			//ax = msg->ax;
+			//ay = msg->ay;
+			//az = msg->az;
+			
+			qw = msg->q[0];
+			qx = msg->q[1];
+			qy = msg->q[2];
+			qz = msg->q[3];
+			
+			Eigen::Quaternionf qf(qw, qx, qy, qz);
+			Eigen::Quaterniond q = qf.cast<double>();
+                        Eigen::Matrix3d R = q.toRotationMatrix();
+			//Eigen::Vector3d euler = R.eulerAngles(2,1,0);
+			
+			double roll  = std::atan2(R(2,1), R(2,2));
+			double pitch = std::asin(-R(2,0));
+			double yaw   = std::atan2(R(1,0), R(0,0));
+
+			rx = static_cast<float>(roll);//euler[2]
+			ry = static_cast<float>(pitch);//euler[1]
+			rz = static_cast<float>(yaw);//euler[0]
+			});
+
+
+		vehicle_local_position_setpoint_sub = this->create_subscription<px4_msgs::msg::VehicleLocalPositionSetpoint>("/fmu/out/vehicle_local_position_setpoint", qos,
+                [this](const px4_msgs::msg::VehicleLocalPositionSetpoint::UniquePtr msg) {
+
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			
+		 	px_d = msg->x;
+			py_d = msg->y;
+			pz_d = msg->z;
+
+			vx_d = msg->vx;
+			vy_d = msg->vy;
+			vz_d = msg->vz;
+
+			ax_d = msg->acceleration[0];
+			ay_d = msg->acceleration[1];
+			az_d = msg->acceleration[2];
+
+			rx_d = 0.f;
+			ry_d = 0.f;
+			rz_d = msg->yaw;
+
+                });
+
+		vehicle_acceleration_sub = this->create_subscription<px4_msgs::msg::VehicleAcceleration>("/fmu/out/vehicle_acceleration", qos,
+                [this](const px4_msgs::msg::VehicleAcceleration::UniquePtr msg) {
+
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+
+                        ax = msg->xyz[0];
+                        ay = msg->xyz[1];
+                        az = msg->xyz[2];
+
+                });
+
+		servo_angle_ros2_sub = this->create_subscription<std_msgs::msg::Float32MultiArray>("servo_angle", qos,
+                [this](const std_msgs::msg::Float32MultiArray::UniquePtr msg) {
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+
+			th1_act = msg->data[0];
+			th2_act = msg->data[1];
+			th3_act = msg->data[2];
+			th4_act = msg->data[3];
+			th5_act = msg->data[4];
+                });
+
+		center_of_mass_sub = this->create_subscription<px4_msgs::msg::CenterOfMass>("/fmu/out/center_of_mass", qos,
+                [this](const px4_msgs::msg::CenterOfMass::UniquePtr msg) {
+
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+            // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+
+			com_lpf_x = msg->com_lpf[0];
+			com_lpf_y = msg->com_lpf[1];  
+			com_lpf_z = msg->com_lpf[2];
+			
+			com_update_x = msg->com_update[0];
+			com_update_y = msg->com_update[1];  
+			com_update_z = msg->com_update[2];
+
+
+		});
+
+		torque_dhat_sub = this->create_subscription<px4_msgs::msg::TorqueDhat>("/fmu/out/torque_dhat", qos,
+                [this](const px4_msgs::msg::TorqueDhat::UniquePtr msg) {
+
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+                        tx_dhat = msg->xyz[0];
+                        ty_dhat = msg->xyz[1];
+                        tz_dhat = msg->xyz[2];
+
+                });
+
+		custom_control_mode_sub = this->create_subscription<std_msgs::msg::Int32MultiArray>("control_mode_flags", qos,
+                [this](const std_msgs::msg::Int32MultiArray::UniquePtr msg) {
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+                        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			dob_flag = sanitize_int(msg->data[0]);
+			custom_mode_flag = sanitize_int(msg->data[1]);
+			trajectory_flag = sanitize_int(msg->data[2]);
+			payload_flag = sanitize_int(msg->data[3]);
+			l1_adaptive_flag = sanitize_int(msg->data[4]);
+	
+		});
+
+		desired_angular_velocity_sub = this->create_subscription<px4_msgs::msg::VehicleRatesSetpoint>("/fmu/out/vehicle_rates_setpoint", qos,
+				[this](const px4_msgs::msg::VehicleRatesSetpoint::UniquePtr msg) {
+
+				rxd_d = msg->roll;
+				ryd_d = msg->pitch;
+				rzd_d = msg->yaw;
+
+			});		
+
+		angular_velocity_sub = this->create_subscription<px4_msgs::msg::VehicleAngularVelocity>(
+			"/fmu/out/vehicle_angular_velocity", qos,
+			[this](const px4_msgs::msg::VehicleAngularVelocity::UniquePtr msg)
+			{
+				// NAN 가드
+				rxd = msg->xyz[0];
+				ryd = msg->xyz[1];
+				rzd = msg->xyz[2];
+			
+				rxdd = msg->xyz_derivative[0];
+				rydd = msg->xyz_derivative[1];
+				rzdd = msg->xyz_derivative[2];
+			
+			});
+
+
+		l1_status_sub =
+			this->create_subscription<px4_msgs::msg::L1AdaptiveStatus>(
+				"/fmu/out/l1_adaptive_status",
+				qos,
+				[this](const px4_msgs::msg::L1AdaptiveStatus::UniquePtr msg)
+				{
+					// disturbance estimate
+					dhat_tau_l1[0] = msg->dhat_tau[0];
+					dhat_tau_l1[1] = msg->dhat_tau[1];
+					dhat_tau_l1[2] = msg->dhat_tau[2];
+
+					// raw compensation torque
+					tau_comp_raw_l1[0] = msg->tau_comp_raw[0];
+					tau_comp_raw_l1[1] = msg->tau_comp_raw[1];
+					tau_comp_raw_l1[2] = msg->tau_comp_raw[2];
+
+					// filtered compensation torque
+					tau_comp_lpf_l1[0] = msg->tau_comp_lpf[0];
+					tau_comp_lpf_l1[1] = msg->tau_comp_lpf[1];
+					tau_comp_lpf_l1[2] = msg->tau_comp_lpf[2];
+				});
+
+
+			dt_sub = this->create_subscription<px4_msgs::msg::CustomDt>(
+				"/fmu/out/custom_dt", qos,
+				[this](const px4_msgs::msg::CustomDt::UniquePtr msg)
+				{
+					std::string stage_name;
+					switch (msg->stage) {
+						case px4_msgs::msg::CustomDt::STAGE_POSITION:
+							stage_name = "POSITION";
+							pos_PID_dt = msg->dt;         // ← 저장
+							break;
+						case px4_msgs::msg::CustomDt::STAGE_VELOCITY:
+							stage_name = "VELOCITY";
+							vel_PID_dt = msg->dt;         // ← 저장
+							break;
+						case px4_msgs::msg::CustomDt::STAGE_ATTITUDE:
+							stage_name = "ATTITUDE";
+							att_PID_dt = msg->dt;         // ← 저장
+							break;
+						case px4_msgs::msg::CustomDt::STAGE_RATE:
+							stage_name = "RATE";
+							rate_PID_dt = msg->dt;        // ← 저장
+							break;
+						case px4_msgs::msg::CustomDt::STAGE_ALLOCATION:
+							stage_name = "ALLOCATION";
+							allo_PID_dt = msg->dt;        // ← 저장
+							break;
+						case px4_msgs::msg::CustomDt::STAGE_DOB:
+							stage_name = "DOB";
+							dob_PID_dt = msg->dt;         // ← 저장
+							break;
+						case px4_msgs::msg::CustomDt::STAGE_COM:
+							stage_name = "COM";
+							com_PID_dt = msg->dt;         // ← 저장
+							break;
+						default:
+							stage_name = "UNKNOWN";
+							break;
+					}
+
+					RCLCPP_INFO(this->get_logger(),
+								"timestamp: %lu, stage: %s (%u), dt: %.9f",
+								msg->timestamp, stage_name.c_str(), msg->stage, msg->dt);
+				});
+
+
+		// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+		// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ TIMER CALLBACK LOOP ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+		// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+		// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+		
+			
+		auto timer_callback = [this]()->void {
+
+
+
+			//std::cout << " Timer callback running!" << std::endl;
+			
+			Eigen::Matrix4f SA;
+	                Eigen::Matrix4f invSA;
+        	        Eigen::Vector4f wrench_servo(fx, fy, tz_trim, 0.0);
+	
+        	        float r_arm = 0.23;
+					constexpr float r2 = 1.41421356f;   // sqrt(2)
+					bool allocation_version_1 = false;
+
+					if (allocation_version_1)
+					{
+						SA <<   f1/r2,     f2/r2,         -(f3/r2),       -(f4/r2),
+								f1/r2,     -(f2/r2),      -(f3/r2),       f4/r2,
+								r_arm*f1,  r_arm*f2,      r_arm*f3,       r_arm*f4,
+								r_arm*f1,  -(r_arm*f2),   r_arm*f3,       -(r_arm*f4);
+					}
+					else
+					{
+						float xc = std::isfinite(com_update_x) ? com_update_x : 0.f;
+						float yc = std::isfinite(com_update_y) ? com_update_y : 0.f;
+
+						float r_arm1 = r_arm - ( (xc - yc) / r2 );
+						float r_arm2 = r_arm + ( (xc + yc) / r2 );
+						float r_arm3 = r_arm + ( (xc - yc) / r2 );
+						float r_arm4 = r_arm - ( (xc + yc) / r2 );					
+
+						SA <<   f1/r2,      f2/r2,          -(f3/r2),       -(f4/r2),
+								f1/r2,      -(f2/r2),       -(f3/r2),       f4/r2,
+								r_arm1*f1,  r_arm2*f2,      r_arm3*f3,      r_arm4*f4,
+								r_arm1*f1,  -(r_arm2*f2),   r_arm3*f3,      -(r_arm4*f4);
+					}
+
+				Eigen::Vector4f sine_theta_command = SA.colPivHouseholderQr().solve(wrench_servo);
+				
+			// (A) |sinθ| ≤ sin(0.7)로 먼저 포화
+			const float sin_max = servoSinMax();
+			for (int i = 0; i < 4; ++i) {
+			sine_theta_command(i) = clampf(sine_theta_command(i), -sin_max, +sin_max);
+			}
+
+			// (B) asin
+			th1_cmd = std::asin(clampf(sine_theta_command(0), -1.f, +1.f));
+			th2_cmd = std::asin(clampf(sine_theta_command(1), -1.f, +1.f));
+			th3_cmd = std::asin(clampf(sine_theta_command(2), -1.f, +1.f));
+			th4_cmd = std::asin(clampf(sine_theta_command(3), -1.f, +1.f));
+
+			// (C) 최종 각도도 안전 포화 (이중 안전)
+			th1_cmd = clampf(th1_cmd, -kServoThetaMax, +kServoThetaMax);
+			th2_cmd = clampf(th2_cmd, -kServoThetaMax, +kServoThetaMax);
+			th3_cmd = clampf(th3_cmd, -kServoThetaMax, +kServoThetaMax);
+			th4_cmd = clampf(th4_cmd, -kServoThetaMax, +kServoThetaMax);
+
+			payload_angle_trajectory();
+
+			// th1_cmd..th4_cmd 계산 직후, 첫 루프 한정
+			static bool lpf_warmed = false;
+			if (!lpf_warmed) {
+			for (int k = 0; k < 3; ++k) { // 2~3회면 충분
+				lpf_th_[0].step(th1_cmd);
+				lpf_th_[1].step(th2_cmd);
+				lpf_th_[2].step(th3_cmd);
+				lpf_th_[3].step(th4_cmd);
+				lpf_th_[4].step(payload_angle_command);
+
+			}
+			lpf_warmed = true;
+			}			
+			
+			// ======= Butterworth 2차 LPF 적용 =======
+			th1_lpf_cmd = lpf_th_[0].step(th1_cmd);
+			th2_lpf_cmd = lpf_th_[1].step(th2_cmd);
+			th3_lpf_cmd = lpf_th_[2].step(th3_cmd);
+			th4_lpf_cmd = lpf_th_[3].step(th4_cmd);
+			payload_lpf_angle_command = lpf_th_[4].step(payload_angle_command);
+
+			// NaN 안전처리
+			if (std::isnan(th1_lpf_cmd)) th1_lpf_cmd = 0.f;
+			if (std::isnan(th2_lpf_cmd)) th2_lpf_cmd = 0.f;
+			if (std::isnan(th3_lpf_cmd)) th3_lpf_cmd = 0.f;
+			if (std::isnan(th4_lpf_cmd)) th4_lpf_cmd = 0.f;
+			if (std::isnan(payload_lpf_angle_command)) payload_lpf_angle_command = 0.f;
+
+			th1_lpf_cmd = clampf(th1_lpf_cmd, -kServoThetaMax, +kServoThetaMax);
+			th2_lpf_cmd = clampf(th2_lpf_cmd, -kServoThetaMax, +kServoThetaMax);
+			th3_lpf_cmd = clampf(th3_lpf_cmd, -kServoThetaMax, +kServoThetaMax);
+			th4_lpf_cmd = clampf(th4_lpf_cmd, -kServoThetaMax, +kServoThetaMax);
+
+			std_msgs::msg::Float32MultiArray servo_angle_command;
+		        servo_angle_command.data.resize(5);
+        		servo_angle_command.data[0] = th1_lpf_cmd;
+		        servo_angle_command.data[1] = th2_lpf_cmd;
+		        servo_angle_command.data[2] = th3_lpf_cmd;
+		        servo_angle_command.data[3] = th4_lpf_cmd;
+				servo_angle_command.data[4] = payload_lpf_angle_command;
+
+			// 퍼블리시
+                        this->servo_angle_cmd_pub->publish(servo_angle_command);
+
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			
+			
+			std_msgs::msg::Float32MultiArray torque_command;
+                        torque_command.data.resize(3);
+                        torque_command.data[0] = tx;
+                        torque_command.data[1] = ty;
+                        torque_command.data[2] = tz;
+
+                        // 퍼블리시
+                        this->torque_command_pub->publish(torque_command);
+			
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			
+			std_msgs::msg::Float32MultiArray force_command;
+                        force_command.data.resize(3);
+                        force_command.data[0] = fx;
+                        force_command.data[1] = fy;
+                        force_command.data[2] = fz;
+
+                        // 퍼블리시
+                        this->force_command_pub->publish(force_command);
+
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			
+
+			std_msgs::msg::Float32MultiArray thrust_command;
+                        thrust_command.data.resize(4);
+                        thrust_command.data[0] = f1;
+                        thrust_command.data[1] = f2;
+                        thrust_command.data[2] = f3;
+                        thrust_command.data[3] = f4;
+
+                        // 퍼블리시
+                        this->thrust_command_pub->publish(thrust_command);
+			
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			/*	
+			std::cout << "============================="   << std::endl;
+                        std::cout << "tx: " << tx   << std::endl;
+                        std::cout << "ty: " << ty  << std::endl;
+                        std::cout << "zz: " << tz  << std::endl;*/
+                        //std::cout << "f4: " << msg->gyro_rad[2]  << std::endl;
+			
+			
+			auto servo_angle_msg = px4_msgs::msg::ServoAngle();
+                        servo_angle_msg.timestamp = std::chrono::time_point_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()).time_since_epoch().count();
+                        std::string name = "servo_angle";
+
+
+					if(th1_act < 0.001 && th1_act > -0.001){th1_act = 0.0;}
+                	if(th2_act < 0.001 && th2_act > -0.001){th2_act = 0.0;}
+               	 	if(th3_act < 0.001 && th3_act > -0.001){th3_act = 0.0;}
+                	if(th4_act < 0.001 && th4_act > -0.001){th4_act = 0.0;}
+                	if(th5_act < 0.001 && th5_act > -0.001){th5_act = 0.0;}
+
+			servo_angle_msg.servo_angle[0] = th1_act;
+			servo_angle_msg.servo_angle[1] = th2_act;
+			servo_angle_msg.servo_angle[2] = th3_act;
+			servo_angle_msg.servo_angle[3] = th4_act;
+			servo_angle_msg.servo_angle[4] = th5_act;
+
+                        this->servo_angle_px4_pub->publish(servo_angle_msg);
+
+			
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //	
+
+			auto control_mode_msg = px4_msgs::msg::CustomControlMode();
+                        control_mode_msg.timestamp = std::chrono::time_point_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()).time_since_epoch().count();
+
+			control_mode_msg.disturbance_observer_flag = dob_flag;
+			control_mode_msg.custom_mode_flag = custom_mode_flag;
+			control_mode_msg.trajectory_flag = trajectory_flag;
+			control_mode_msg.l1_adaptive_flag = l1_adaptive_flag;
+
+			this->custom_control_mode_pub->publish(control_mode_msg);
+
+
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡFOR DATA LOGGINGㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+			
+			std::vector<float> raw_data = {
+				px, py, pz,
+			    	px_d, py_d, pz_d,
+			    	vx, vy, vz,
+			    	vx_d, vy_d, vz_d,
+			    	rx, ry, rz,
+			    	rx_d, ry_d, rz_d,
+			    	rxd, ryd, rzd,
+			    	rxd_d, ryd_d, rzd_d,
+			    	fx, fy, fz,
+			    	tx, ty, tz, 
+				tz_trim,
+				tx_dhat, ty_dhat, tz_dhat,
+			    	f1, f2, f3, f4,
+			    	th1_act, th2_act, th3_act, th4_act, th5_act,
+			    	th1_cmd, th2_cmd, th3_cmd, th4_cmd, payload_angle_command,
+				ax, ay, az,
+				ax_d, ay_d, az_d,
+				0, 0, 0,
+				com_lpf_x, com_lpf_y, com_lpf_z,
+				0, 0, 0,
+				com_update_x, com_update_y,com_update_z,
+				th1_lpf_cmd, th2_lpf_cmd, th3_lpf_cmd, th4_lpf_cmd,
+				pwm1, pwm2, pwm3, pwm4,
+				rxdd, rydd, rzdd,
+				pos_PID_dt, vel_PID_dt, att_PID_dt, rate_PID_dt, allo_PID_dt, dob_PID_dt, com_PID_dt,
+				dhat_tau_l1[0], dhat_tau_l1[1], dhat_tau_l1[2],
+				tau_comp_raw_l1[0], tau_comp_raw_l1[1], tau_comp_raw_l1[2],
+				tau_comp_lpf_l1[0], tau_comp_lpf_l1[1], tau_comp_lpf_l1[2]
+			};
+
+			// 메시지 생성 및 초기화
+			std_msgs::msg::Float32MultiArray data_log_array;
+			data_log_array.data.resize(raw_data.size());
+			// sanitize 후 저장
+			for (size_t i = 0; i < raw_data.size(); ++i) {
+				data_log_array.data[i] = sanitize(raw_data[i]);
+			}
+			
+
+                        // 퍼블리시
+                        this->data_logging_pub->publish(data_log_array);
+
+
+                };
+
+                timer_ = this->create_wall_timer(10ms, timer_callback);
+
+
+
+        }
+
+private:
+
+	// --- Servo command LPF (for th1..th4) ---
+	Biquad lpf_th_[5];
+	bool   lpf_inited_{false};
+	double servo_lpf_fc_hz_{8.0};  // 파라미터로 설정
+	double servo_lpf_fs_hz_{100.0};  // 샘플링 주파수 Hz (여기서 고정)
+
+	float fx = 0.0f, fy = 0.0f, fz = 0.0f, tx = 0.0f, ty = 0.0f, tz = 0.0f, tz_trim = 0.0f;
+	float tx_dhat = 0.f, ty_dhat = 0.f, tz_dhat = 0.f;
+	float f1 = 0.0f, f2 = 0.0f, f3 = 0.0f, f4 = 0.0f;
+	float pwm1 = 0.0f, pwm2 = 0.0f, pwm3 = 0.0f, pwm4 = 0.0f;
+	float th1_cmd = 0.0f, th2_cmd = 0.0f, th3_cmd = 0.0f, th4_cmd = 0.0f, th5_cmd;
+	float th1_lpf_cmd = 0.0f, th2_lpf_cmd = 0.0f, th3_lpf_cmd = 0.0f, th4_lpf_cmd = 0.0f;
+	float th1_act = 0.0f, th2_act = 0.0f, th3_act = 0.0f, th4_act = 0.0f, th5_act;
+
+	float px = 0.f, py = 0.f, pz = 0.f, qx = 0.f, qy = 0.f, qz = 0.f, qw = 0.f;
+	float vx = 0.f, vy = 0.f, vz = 0.f, rx = 0.f, ry = 0.f, rz = 0.f;
+	float ax = 0.f, ay = 0.f, az = 0.f, rxd = 0.f, ryd = 0.f, rzd = 0.f, rxdd = 0.f, rydd = 0.f, rzdd = 0.f;
+	float px_d = 0.f, py_d = 0.f, pz_d = 0.f, rx_d = 0.f, ry_d = 0.f, rz_d = 0.f;
+	float vx_d = 0.f, vy_d = 0.f, vz_d = 0.f, rxd_d = 0.f, ryd_d = 0.f, rzd_d = 0.f;
+	float ax_d = 0.f, ay_d = 0.f, az_d = 0.f; 
+
+	float com_lpf_x = 0.f, com_lpf_y = 0.f, com_lpf_z = 0.f;
+	float com_update_x = 0.f, com_update_y = 0.f, com_update_z = 0.f;	
+
+	int dob_flag = 0; int custom_mode_flag = 0;	int trajectory_flag = 0; int payload_flag = 0; int l1_adaptive_flag = 0;
+	
+	float pos_PID_dt = 0.f, vel_PID_dt = 0.f, att_PID_dt = 0.f, rate_PID_dt = 0.f, allo_PID_dt = 0.f, dob_PID_dt = 0.f, com_PID_dt = 0.f;
+
+	float radian_command = 0.174533;
+	float payload_angle_command = 0.f;
+	float payload_lpf_angle_command = 0.f;
+	
+
+	// ===== L1 Adaptive status =====
+	float dhat_tau_l1[3]     = {0.f, 0.f, 0.f};
+	float tau_comp_raw_l1[3] = {0.f, 0.f, 0.f};
+	float tau_comp_lpf_l1[3] = {0.f, 0.f, 0.f};
+
+	// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ  Utility Function ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+        // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+static constexpr float kServoThetaMax = 0.7f; // Servo Saturation angle
+
+static inline float clampf(float x, float lo, float hi) {
+  return (x < lo) ? lo : (x > hi) ? hi : x;
+}
+
+static inline float servoSinMax() {
+  return std::sin(kServoThetaMax);   // float overload OK
+}
+
+
+	double wrapToPi(double angle) {
+		return std::atan2(std::sin(angle), std::cos(angle));
+	}		
+
+	inline int sanitize_int(int value) { return value; }
+
+
+	inline float sanitize(float value) {
+		return std::isnan(value) ? 0.f : value;
+	}
+
+	float setThrustLimitation(float thrust_command){
+                        if(thrust_command < 2.0){ thrust_command = 2.0;}
+                        if(thrust_command > 55.0){ thrust_command = 55.0;}
+                        return thrust_command;
+	}
+
+
+
+void payload_angle_trajectory()
+{
+    constexpr float dt     = 0.01f;
+    constexpr float move_T = 20.0f;
+    constexpr float hold_T = 45.0f;
+
+    constexpr float boot_move_T = 10.0f;   // 부팅 시 0->180 10초
+
+    constexpr float deg2rad = 3.141592f / 180.0f;
+    constexpr float a0   = 0.0f   * deg2rad;
+    constexpr float a180 = 180.0f * deg2rad;
+
+    enum Phase : int {
+        BOOT_MOVE_0_TO_180 = 0,
+        MOVE_180_TO_0,
+        HOLD_0,
+        MOVE_0_TO_180,
+    };
+
+    static int   phase = BOOT_MOVE_0_TO_180;
+    static float t_in_phase = 0.0f;
+
+    static bool boot_done = false;   // 부팅 램프 완료 여부
+    static bool done_once = false;   // 시퀀스 1회 완료 여부
+
+    // ============================================================
+    // (0) BOOT 램프: payload_flag 무관하게 딱 1번 (0->180, 10s)
+    // ============================================================
+    if (!boot_done) {
+        const float start = a0;
+        const float end   = a180;
+        const float duration = (boot_move_T < 1e-6f) ? 1e-6f : boot_move_T;
+
+        t_in_phase += dt;
+        float s = t_in_phase / duration;
+        if (s > 1.0f) s = 1.0f;
+
+        const float target = start + (end - start) * s;
+
+        const float max_rate = fabsf(end - start) / duration;
+        const float max_step = max_rate * dt;
+
+        const float err = target - payload_angle_command;
+        if      (err >  max_step) payload_angle_command += max_step;
+        else if (err < -max_step) payload_angle_command -= max_step;
+        else                      payload_angle_command = target;
+
+        payload_angle_command = clampf(payload_angle_command, a0, a180);
+
+        if (t_in_phase >= duration) {
+            t_in_phase = 0.0f;
+            boot_done = true;
+            phase = MOVE_180_TO_0;   // 시퀀스 준비 상태
+            done_once = false;       // 안전하게 초기화
+            payload_angle_command = a180; // 부팅 종료 시 180에 확정
+        }
+        return;
+    }
+
+    // ============================================================
+    // (1) payload_flag == 0: 180도로 "천천히" 복귀 (점프 금지)
+    //     - 시퀀스 상태는 리셋해서 다음 ON에서 다시 1회 수행 가능
+    // ============================================================
+    if (payload_flag == 0) {
+
+        // 다음 ON 때 다시 1회 시퀀스 가능하도록 상태 리셋
+        phase = MOVE_180_TO_0;
+        t_in_phase = 0.0f;
+        done_once = false;
+
+        // ✅ 현재 각도에서 180으로 rate-limit 복귀
+        constexpr float return_T = 3.0f;  // <-- 180으로 돌아가는 시간(초). 원하는 값으로 조절
+        const float duration = (return_T < 1e-6f) ? 1e-6f : return_T;
+
+        const float target = a180;
+
+        const float max_rate = fabsf(a180 - a0) / duration;  // [rad/s]
+        const float max_step = max_rate * dt;                // [rad/step]
+
+        const float err = target - payload_angle_command;
+        if      (err >  max_step) payload_angle_command += max_step;
+        else if (err < -max_step) payload_angle_command -= max_step;
+        else                      payload_angle_command = target;
+
+        payload_angle_command = clampf(payload_angle_command, a0, a180);
+        return;
+    }
+
+    // ============================================================
+    // (2) payload_flag == 1: 1회 시퀀스 (180->0 -> hold -> 0->180)
+    // ============================================================
+    if (done_once) {
+        payload_angle_command = a180;   // 완료 후 180 고정
+        return;
+    }
+
+    float start = a0, end = a0, duration = move_T;
+
+    switch (phase) {
+    case MOVE_180_TO_0:
+        start = a180; end = a0;   duration = move_T;
+        break;
+    case HOLD_0:
+        start = a0;   end = a0;   duration = hold_T;
+        break;
+    case MOVE_0_TO_180:
+    default:
+        start = a0;   end = a180; duration = move_T;
+        break;
+    }
+
+    t_in_phase += dt;
+    if (duration < 1e-6f) duration = 1e-6f;
+
+    float s = t_in_phase / duration;
+    if (s > 1.0f) s = 1.0f;
+
+    const float target = start + (end - start) * s;
+
+    const float max_rate = fabsf(end - start) / duration;
+    const float max_step = max_rate * dt;
+
+    const float err = target - payload_angle_command;
+    if      (err >  max_step) payload_angle_command += max_step;
+    else if (err < -max_step) payload_angle_command -= max_step;
+    else                      payload_angle_command = target;
+
+    payload_angle_command = clampf(payload_angle_command, a0, a180);
+
+    // phase advance
+    if (t_in_phase >= duration) {
+        t_in_phase = 0.0f;
+
+        if (phase == MOVE_180_TO_0)      phase = HOLD_0;
+        else if (phase == HOLD_0)        phase = MOVE_0_TO_180;
+        else {
+            done_once = true;            // 1회 완료
+            payload_angle_command = a180;
+        }
+    }
+}
+
+
+// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+        
+	rclcpp::TimerBase::SharedPtr timer_;
+
+	rclcpp::Time t_prev_;  
+	
+	// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+	
+	rclcpp::Publisher<px4_msgs::msg::ServoAngle>::SharedPtr servo_angle_px4_pub;
+	rclcpp::Publisher<px4_msgs::msg::CustomControlMode>::SharedPtr custom_control_mode_pub;
+	rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr servo_angle_cmd_pub;
+
+	rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr torque_command_pub;
+	rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr force_command_pub;
+	rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr thrust_command_pub;
+
+
+	rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr data_logging_pub;
+	
+	// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+	
+	rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr custom_control_mode_sub;
+	rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr servo_angle_ros2_sub;
+	rclcpp::Subscription<px4_msgs::msg::VehicleTorqueSetpoint>::SharedPtr torque_command_sub;
+	rclcpp::Subscription<px4_msgs::msg::ThrustCommand>::SharedPtr thrust_command_sub;
+	rclcpp::Subscription<px4_msgs::msg::ActuatorMotors>::SharedPtr motor_command_sub;
+ 	rclcpp::Subscription<px4_msgs::msg::VehicleThrustSetpoint>::SharedPtr force_command_sub;
+
+	rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr vehicle_odometry_sub;
+	rclcpp::Subscription<px4_msgs::msg::VehicleLocalPositionSetpoint>::SharedPtr vehicle_local_position_setpoint_sub;
+
+	rclcpp::Subscription<px4_msgs::msg::VehicleAcceleration>::SharedPtr vehicle_acceleration_sub;
+	rclcpp::Subscription<px4_msgs::msg::CenterOfMass>::SharedPtr center_of_mass_sub;
+
+	rclcpp::Subscription<px4_msgs::msg::TorqueDhat>::SharedPtr torque_dhat_sub;
+	rclcpp::Subscription<px4_msgs::msg::VehicleRatesSetpoint>::SharedPtr desired_angular_velocity_sub;
+	rclcpp::Subscription<px4_msgs::msg::VehicleAngularVelocity>::SharedPtr angular_velocity_sub;
+    rclcpp::Subscription<px4_msgs::msg::CustomDt>::SharedPtr dt_sub;
+	rclcpp::Subscription<px4_msgs::msg::L1AdaptiveStatus>::SharedPtr l1_status_sub;	
+
+};
+
+int main(int argc, char *argv[])
+{
+
+	// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+	
+	// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
+
+        std::cout << "Starting servo_angle_msg advertiser node..." << std::endl;
+        setvbuf(stdout, NULL, _IONBF, BUFSIZ);
+        rclcpp::init(argc, argv);
+        rclcpp::spin(std::make_shared<ListenAndSpeakRos>());
+
+        rclcpp::shutdown();
+        return 0;
+}

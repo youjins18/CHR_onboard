@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.vscode/
+
+data_logging/bags/*
+!data_logging/bags/.gitkeep
+data_logging/csv/
+*.db3
+*.mcap
+*.pyc
