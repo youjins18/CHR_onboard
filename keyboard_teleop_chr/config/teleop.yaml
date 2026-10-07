@@ -6,7 +6,10 @@ keyboard_teleop_chr:
     workspace_min: [-2.0, -2.0, 0.05]
     workspace_max: [2.0, 2.0, 3.0]
 
-    # Conservative first-flight trajectory around the EE pose at the G-key event.
-    trajectory_amplitude_m: [0.04, 0.04, 0.025]
-    trajectory_frequency_hz: [0.05, 0.10, 0.05]
+    # One closed Lissajous trajectory around the EE pose at the G-key event.
+    # Position frequencies use the 1:2:3 ratio. EE local-z yaw is unconstrained.
+    trajectory_amplitude_m: [0.04, 0.04, 0.02]
+    trajectory_base_frequency_hz: 0.05
+    trajectory_roll_amplitude_deg: 8.0
+    trajectory_pitch_amplitude_deg: 6.0
     trajectory_ramp_in_s: 3.0

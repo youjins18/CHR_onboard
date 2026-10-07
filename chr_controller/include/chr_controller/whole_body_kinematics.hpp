@@ -52,7 +52,8 @@ class WholeBodyKinematics {
   static Eigen::Isometry3d tcp_in_world(
     const Eigen::Isometry3d &world_from_base, const JointVector &joint_position);
 
-  /// Solve TCP pose with q=[base x,y,z,yaw,J1,J2,J3].
+  /// Solve TCP position and tool-z tilt with q=[base x,y,z,yaw,J1,J2,J3].
+  /// Rotation about the TCP local z axis is intentionally unconstrained.
   PoseIkResult solve_pose_dls(
     const Eigen::Vector3d &seed_base_position,
     const Eigen::Quaterniond &seed_base_orientation,

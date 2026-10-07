@@ -1,70 +1,113 @@
 #!/usr/bin/env python3
-"""Export Float32MultiArray logging topics from a ROS 2 bag to CSV files."""
+"""Export every message in a ROS 2 bag to one long-form CSV file."""
+
+from __future__ import annotations
 
 import argparse
 import csv
-import re
+from collections.abc import Sequence
 from pathlib import Path
+import sys
+from typing import Any, Iterator
 
+import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
-import rosbag2_py
 
 
-def topic_filename(topic: str) -> str:
-    stem = re.sub(r"[^A-Za-z0-9]+", "_", topic).strip("_")
-    return f"{stem or 'topic'}.csv"
+BASE_COLUMNS = ("time_ns", "time_s", "topic", "message_type")
 
 
-def export_topics(bag: Path, output: Path, topics: list[str], storage_id: str) -> None:
+def flatten_message(value: Any, prefix: str = "", output=None) -> dict[str, Any]:
+    """Flatten nested ROS messages and arrays into stable CSV columns."""
+    output = {} if output is None else output
+    fields = getattr(value, "get_fields_and_field_types", None)
+    if callable(fields):
+        for field_name in fields():
+            child_prefix = f"{prefix}.{field_name}" if prefix else field_name
+            flatten_message(getattr(value, field_name), child_prefix, output)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, item in enumerate(value):
+            flatten_message(item, f"{prefix}[{index}]", output)
+    elif hasattr(value, "tolist"):
+        flatten_message(value.tolist(), prefix, output)
+    else:
+        output[prefix] = value
+    return output
+
+
+def open_reader(bag_path: Path, storage_id: str):
     reader = rosbag2_py.SequentialReader()
     reader.open(
-        rosbag2_py.StorageOptions(uri=str(bag), storage_id=storage_id),
+        rosbag2_py.StorageOptions(uri=str(bag_path), storage_id=storage_id),
         rosbag2_py.ConverterOptions("", ""),
     )
-    type_map = {item.name: item.type for item in reader.get_all_topics_and_types()}
-    missing = sorted(set(topics) - set(type_map))
-    if missing:
-        raise RuntimeError(f"topics absent from bag: {', '.join(missing)}")
+    return reader
 
-    output.mkdir(parents=True, exist_ok=True)
-    rows: dict[str, list[tuple[int, list[float]]]] = {topic: [] for topic in topics}
+
+def rows(bag_path: Path, storage_id: str) -> Iterator[dict[str, Any]]:
+    reader = open_reader(bag_path, storage_id)
+    topic_types = {}
+    for topic in reader.get_all_topics_and_types():
+        try:
+            message_class = get_message(topic.type)
+        except (AttributeError, ImportError, ModuleNotFoundError) as error:
+            package = topic.type.split("/", maxsplit=1)[0]
+            raise RuntimeError(
+                f"cannot load {topic.type}; source the workspace that provides {package}"
+            ) from error
+        topic_types[topic.name] = (topic.type, message_class)
+
+    first_timestamp = None
     while reader.has_next():
-        topic, serialized, timestamp_ns = reader.read_next()
-        if topic not in rows:
-            continue
-        message = deserialize_message(serialized, get_message(type_map[topic]))
-        if not hasattr(message, "data"):
-            raise TypeError(f"{topic} ({type_map[topic]}) has no data field")
-        rows[topic].append((timestamp_ns, list(message.data)))
-
-    for topic, samples in rows.items():
-        if not samples:
-            print(f"warning: no samples for {topic}")
-            continue
-        width = max(len(data) for _, data in samples)
-        destination = output / topic_filename(topic)
-        with destination.open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.writer(stream)
-            writer.writerow(["timestamp_ns"] + [f"data[{index}]" for index in range(width)])
-            for timestamp_ns, data in samples:
-                writer.writerow([timestamp_ns] + data + [""] * (width - len(data)))
-        print(f"wrote {destination} ({len(samples)} rows, {width} values)")
+        topic, serialized, timestamp = reader.read_next()
+        if first_timestamp is None:
+            first_timestamp = timestamp
+        type_name, message_class = topic_types[topic]
+        row = {
+            "time_ns": timestamp,
+            "time_s": (timestamp - first_timestamp) * 1e-9,
+            "topic": topic,
+            "message_type": type_name,
+        }
+        row.update(flatten_message(deserialize_message(serialized, message_class)))
+        yield row
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("bag", type=Path, help="ROS 2 bag directory")
-    parser.add_argument("--output", type=Path, default=Path("csv"))
+def export_bag(bag_path: Path, output_path: Path, storage_id: str) -> int:
+    if not bag_path.is_dir():
+        raise FileNotFoundError(f"bag directory does not exist: {bag_path}")
+
+    dynamic_columns: set[str] = set()
+    message_count = 0
+    for row in rows(bag_path, storage_id):
+        dynamic_columns.update(row.keys())
+        message_count += 1
+
+    columns = [*BASE_COLUMNS, *sorted(dynamic_columns.difference(BASE_COLUMNS))]
+    with output_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows(bag_path, storage_id))
+    return message_count
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Convert one ROS 2 bag to one CSV file.")
+    parser.add_argument("bag", help="bag directory containing metadata.yaml")
     parser.add_argument("--storage-id", default="sqlite3")
-    parser.add_argument(
-        "--topics",
-        nargs="+",
-        default=["/data_logging_msg", "/chr/data_logging_msg"],
-    )
     arguments = parser.parse_args()
-    export_topics(arguments.bag, arguments.output, arguments.topics, arguments.storage_id)
+
+    bag_path = Path(arguments.bag).expanduser().resolve()
+    output_path = bag_path / f"{bag_path.name}.csv"
+    try:
+        count = export_bag(bag_path, output_path, arguments.storage_id)
+    except (FileNotFoundError, RuntimeError) as error:
+        print(f"rosbag_to_csv: error: {error}", file=sys.stderr)
+        return 1
+    print(f"Exported {count} messages to {output_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

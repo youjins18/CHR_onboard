@@ -55,19 +55,16 @@ df -h ~/Desktop/chr_onboard_ws/src/data_logging/bags
 
 ### 터미널 1 — 전체 stack과 자동 rosbag
 
-실험별 이름을 `run01`, `run02`처럼 바꾼다.
-
 ```bash
 cd ~/Desktop/chr_onboard_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 launch chr_controller temporary_experiment.launch.py \
-  bag_name:=20261008_run01_hover_ee
+ros2 launch chr_controller temporary_experiment.launch.py
 ```
 
 launch 직후 확인:
 
-- [ ] rosbag이 `src/data_logging/bags/20261008_run01_hover_ee`에 기록을
+- [ ] rosbag이 `src/data_logging/bags/rosbag2_YYYY_MM_DD-HH_MM_SS`에 기록을
       시작했다.
 - [ ] `listen_and_speak_ros`, tilt controller, arm driver, `chr_controller`가
       오류 없이 시작했다.
@@ -76,8 +73,7 @@ launch 직후 확인:
 - [ ] `/chr/controller_state`가 처음에는 `WAITING_FOR_FEEDBACK` 또는
       `WAITING_FOR_HOVER`로 표시된다.
 
-동일한 `bag_name`을 두 번 사용하면 rosbag이 시작되지 않는다. 이 경우
-launch를 종료하고 새로운 run 이름으로 다시 시작한다.
+실제 생성된 bag 폴더 이름을 실험 노트의 run 이름으로 기록한다.
 
 ### 터미널 2 — Keyboard
 
@@ -131,12 +127,11 @@ Hover gate 기준은 선속도 `0.15 m/s` 이하, 각속도 `0.20 rad/s` 이하�
 | EE +Z / -Z | `R` / `F` | `0.01 m` |
 | EE +roll / -roll | `I` / `K` | `3 deg` |
 | EE +pitch / -pitch | `J` / `L` | `3 deg` |
-| EE +yaw / -yaw | `U` / `O` | `3 deg` |
 | 현재 측정 EE pose로 target 복귀 | `Space` | trajectory도 함께 정지 |
 | 현재 target 출력 | `P` | 동작 변화 없음 |
-| 사전 정의 EE trajectory ON/OFF | `G` | 현재 target을 중심으로 시작/정지 |
+| 단일 xyz+roll/pitch Lissajous ON/OFF | `G` | 현재 target을 중심으로 시작/정지 |
 | Palletrone DOB ON/OFF | `B` | 실험 계획에 포함된 경우에만 사용 |
-| Arm 실험/DLS 요청 ON/OFF | `M` | Torque 요청과 DLS 자동 절차 시작/정지 |
+| Arm torque/DLS 요청 ON/OFF | `M` | Torque 요청과 DLS 자동 절차 시작/정지 |
 
 `C`, `V`, `T`, `0`, `?`, `Q`, `Esc`는 사용하지 않으며 기능도 없다.
 Keyboard 프로세스 종료는 실험 종료 절차를 마친 뒤 `Ctrl-C`로 한다.
@@ -168,13 +163,13 @@ Keyboard 프로세스 종료는 실험 종료 절차를 마친 뒤 `Ctrl-C`로 �
 
 ### C. 작은 수동 EE 확인
 
-1. [ ] `P`로 현재 target xyz/rpy를 출력한다.
+1. [ ] `P`로 현재 target xyz/roll/pitch를 출력한다.
 2. [ ] 한 축만 선택해 한 번만 누른다. 첫 입력은 `W/S`, `A/D`, `R/F`
        중 계획된 안전 방향을 사용한다.
 3. [ ] Palletrone과 arm이 예상 방향으로 작게 움직이는지 확인한다.
 4. [ ] 위치 오차, 진동, arm limit 접근, DLS reject 로그가 없는지 확인한다.
 5. [ ] 필요하면 `Space`를 눌러 현재 측정 EE pose를 새 target으로 만든다.
-6. [ ] 위치 확인이 끝난 뒤에만 RPY를 축별로 한 번씩 확인한다.
+6. [ ] 위치 확인이 끝난 뒤에만 roll과 pitch를 축별로 한 번씩 확인한다.
 
 한 축이라도 방향이 반대거나 큰 진동이 나타나면 `M`을 눌러 DLS를 끄고
 실험을 중단한다.
@@ -190,9 +185,15 @@ Keyboard 프로세스 종료는 실험 종료 절차를 마친 뒤 `Ctrl-C`로 �
        계속 감시한다.
 6. [ ] 계획된 구간이 끝나면 `G`를 다시 눌러 trajectory를 정지한다.
 
-Trajectory는 현재 target을 중심으로 X/Y 약 `4 cm`, Z 약 `2.5 cm` 범위의
-보수적인 경로를 사용한다. 수동 EE 키나 `Space`를 누르면 trajectory는
-자동으로 정지한다.
+Trajectory는 하나뿐이다. 현재 target을 중심으로 주파수 비 `1:2:3`의
+닫힌 Lissajous 곡선을 사용하며 X/Y `±4 cm`, Z `±2 cm`, roll `±8 deg`,
+pitch `±6 deg`를 동시에 명령한다. 기본 주기는 20초이고 처음 3초는
+quintic ramp-in이다. 수동 EE 키나 `Space`를 누르면 trajectory는 자동으로
+정지한다.
+
+EE가 뻗는 local z축 주위의 yaw/twist는 keyboard에서 명령하지 않으며
+DLS 오차와 수렴 판정에서도 제외한다. Palletrone base yaw는 position과
+tool-z tilt를 만드는 데 사용할 수 있는 출력 자유도로 유지한다.
 
 ## 6. 정상 종료 순서
 
@@ -242,7 +243,7 @@ ros2 service call /cone/set_torque std_srvs/srv/SetBool "{data: false}"
 
 ```bash
 cd ~/Desktop/chr_onboard_ws/src
-LATEST_BAG=$(ls -dt data_logging/bags/*_chr data_logging/bags/*_ee 2>/dev/null | head -n 1)
+LATEST_BAG=$(ls -dt data_logging/bags/rosbag2_* | head -n 1)
 echo "${LATEST_BAG}"
 ros2 bag info "${LATEST_BAG}"
 ```
@@ -256,15 +257,18 @@ ros2 bag info "${LATEST_BAG}"
 - [ ] Run 이름과 실제 수행 조건(DOB 여부, 수동/trajectory, 특이사항)을
       실험 노트에 적었다.
 
-CSV 변환:
+CSV 변환은 simulator와 동일하게 bag 경로 하나만 넘긴다. CSV는 해당 bag
+폴더 안에 같은 이름으로 생성된다.
 
 ```bash
-cd ~/Desktop/chr_onboard_ws/src
-RUN_NAME=20261008_run01_hover_ee
-python3 data_logging/rosbag_to_csv.py \
-  "data_logging/bags/${RUN_NAME}" \
-  --output "data_logging/csv/${RUN_NAME}"
+source /opt/ros/humble/setup.bash
+source ~/Desktop/chr_onboard_ws/install/setup.bash
+cd ~/Desktop/chr_onboard_ws/src/data_logging
+python3 rosbag_to_csv.py bags/rosbag2_YYYY_MM_DD-HH_MM_SS/
 ```
+
+MATLAB에서는 생성된 CSV 하나를 선택해 `Palletrone_Decryptor`와
+`CHR_Decryptor`를 각각 실행한다.
 
 ## 9. Run별 최소 기록 항목
 
@@ -278,4 +282,3 @@ python3 data_logging/rosbag_to_csv.py \
 - 최대 진동 또는 비정상 움직임
 - DLS reject, feedback timeout, Dynamixel 오류 여부
 - 정상 종료인지 중단 run인지
-

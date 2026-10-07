@@ -12,7 +12,7 @@ namespace chr_controller {
 namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kFiniteDifferenceStep = 1e-6;
-constexpr Eigen::Index kTaskDimension = 6;
+constexpr Eigen::Index kTaskDimension = 5;
 constexpr Eigen::Index kCoordinateCount = 7;
 constexpr Eigen::Index kBaseYawIndex = 3;
 constexpr Eigen::Index kArmCoordinateOffset = 4;
@@ -20,6 +20,8 @@ constexpr Eigen::Index kArmCoordinateOffset = 4;
 using TaskVector = Eigen::Matrix<double, kTaskDimension, 1>;
 using CoordinateVector = Eigen::Matrix<double, kCoordinateCount, 1>;
 using TaskJacobian = Eigen::Matrix<double, kTaskDimension, kCoordinateCount>;
+using TiltBasis = Eigen::Matrix<double, 3, 2>;
+using TiltVector = Eigen::Matrix<double, 2, 1>;
 
 Eigen::Isometry3d fixed_transform(
     const Eigen::Vector3d &translation, const Eigen::Quaterniond &quaternion) {
@@ -35,12 +37,32 @@ Eigen::Isometry3d revolute_z(double angle) {
   return transform;
 }
 
-Eigen::Vector3d rotation_vector(const Eigen::Matrix3d &rotation) {
-  const Eigen::AngleAxisd angle_axis(rotation);
-  if (!std::isfinite(angle_axis.angle()) || angle_axis.angle() < 1e-12) {
+TiltBasis tool_axis_tilt_basis(const Eigen::Matrix3d &target_rotation) {
+  const Eigen::Vector3d target_axis = target_rotation.col(2).normalized();
+  TiltBasis basis;
+  basis.col(0) = target_axis.unitOrthogonal();
+  basis.col(1) = target_axis.cross(basis.col(0)).normalized();
+  return basis;
+}
+
+Eigen::Vector3d tool_axis_tilt_error(
+    const Eigen::Matrix3d &current_rotation, const Eigen::Vector3d &target_axis) {
+  const Eigen::Vector3d current_axis = current_rotation.col(2).normalized();
+  const Eigen::Vector3d cross = current_axis.cross(target_axis);
+  const double sine = cross.norm();
+  const double cosine = std::clamp(current_axis.dot(target_axis), -1.0, 1.0);
+  if (sine < 1e-12) {
+    if (cosine < 0.0) return target_axis.unitOrthogonal() * kPi;
     return Eigen::Vector3d::Zero();
   }
-  return angle_axis.axis() * angle_axis.angle();
+  return cross * (std::atan2(sine, cosine) / sine);
+}
+
+TiltVector tool_axis_tilt_coordinates(
+    const Eigen::Matrix3d &current_rotation,
+    const Eigen::Vector3d &target_axis,
+    const TiltBasis &basis) {
+  return basis.transpose() * tool_axis_tilt_error(current_rotation, target_axis);
 }
 }  // namespace
 
@@ -127,13 +149,16 @@ PoseIkResult WholeBodyKinematics::solve_pose_dls(
     seed_base_position - options.maximum_base_displacement_m.cwiseAbs();
   const Eigen::Vector3d base_upper =
     seed_base_position + options.maximum_base_displacement_m.cwiseAbs();
+  const Eigen::Vector3d target_tool_axis = target_pose.rotation().col(2).normalized();
+  const TiltBasis tilt_basis = tool_axis_tilt_basis(target_pose.rotation());
 
   for (std::size_t iteration = 0; iteration < options.maximum_iterations; ++iteration) {
     const auto current_pose = tcp_in_world(
       base_pose(result.base_position, result.base_orientation), result.joint_position);
     const Eigen::Vector3d position_error = target_pose.translation() - current_pose.translation();
-    const Eigen::Vector3d orientation_error = rotation_vector(
-      target_pose.rotation() * current_pose.rotation().transpose());
+    const Eigen::Vector3d orientation_error =
+      tool_axis_tilt_error(current_pose.rotation(), target_tool_axis);
+    const TiltVector tilt_error = tilt_basis.transpose() * orientation_error;
     result.position_residual_m = position_error.norm();
     result.orientation_residual_rad = orientation_error.norm();
     result.iterations = iteration + 1;
@@ -163,14 +188,17 @@ PoseIkResult WholeBodyKinematics::solve_pose_dls(
       jacobian.block<3, 1>(0, column) =
         (positive_pose.translation() - negative_pose.translation()) /
         (2.0 * kFiniteDifferenceStep);
-      jacobian.block<3, 1>(3, column) = orientation_weight * rotation_vector(
-        positive_pose.rotation() * negative_pose.rotation().transpose()) /
-        (2.0 * kFiniteDifferenceStep);
+      const TiltVector positive_tilt_error = tool_axis_tilt_coordinates(
+        positive_pose.rotation(), target_tool_axis, tilt_basis);
+      const TiltVector negative_tilt_error = tool_axis_tilt_coordinates(
+        negative_pose.rotation(), target_tool_axis, tilt_basis);
+      jacobian.block<2, 1>(3, column) = -orientation_weight *
+        (positive_tilt_error - negative_tilt_error) / (2.0 * kFiniteDifferenceStep);
     }
 
     TaskVector error;
     error.head<3>() = position_error;
-    error.tail<3>() = orientation_weight * orientation_error;
+    error.tail<2>() = orientation_weight * tilt_error;
     CoordinateVector coordinate_scale;
     coordinate_scale <<
       options.base_translation_scale, options.base_translation_scale,
@@ -214,8 +242,8 @@ PoseIkResult WholeBodyKinematics::solve_pose_dls(
   const auto current_pose = tcp_in_world(
     base_pose(result.base_position, result.base_orientation), result.joint_position);
   result.position_residual_m = (target_pose.translation() - current_pose.translation()).norm();
-  result.orientation_residual_rad = rotation_vector(
-    target_pose.rotation() * current_pose.rotation().transpose()).norm();
+  result.orientation_residual_rad =
+    tool_axis_tilt_error(current_pose.rotation(), target_tool_axis).norm();
   return result;
 }
 

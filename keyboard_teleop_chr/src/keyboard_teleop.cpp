@@ -21,6 +21,7 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr char kWorldFrame[] = "world_enu";
 using Vec3 = std::array<double, 3>;
+using Vec2 = std::array<double, 2>;
 using Quaternion = geometry_msgs::msg::Quaternion;
 using SteadyClock = std::chrono::steady_clock;
 
@@ -57,15 +58,13 @@ Quaternion axis_angle(int axis, double angle) {
   return result;
 }
 
-Vec3 quaternion_to_rpy(const Quaternion &input) {
+Vec2 quaternion_to_roll_pitch(const Quaternion &input) {
   const auto q = normalized(input);
   const double roll = std::atan2(
     2.0 * (q.w * q.x + q.y * q.z), 1.0 - 2.0 * (q.x * q.x + q.y * q.y));
   const double pitch = std::asin(std::clamp(
     2.0 * (q.w * q.y - q.z * q.x), -1.0, 1.0));
-  const double yaw = std::atan2(
-    2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
-  return {roll, pitch, yaw};
+  return {roll, pitch};
 }
 
 double quintic_ramp(double elapsed, double duration) {
@@ -84,17 +83,25 @@ class KeyboardTeleop final : public rclcpp::Node {
     workspace_min_ = vector_parameter("workspace_min", {-2.0, -2.0, 0.05});
     workspace_max_ = vector_parameter("workspace_max", {2.0, 2.0, 3.0});
     trajectory_amplitude_ = vector_parameter(
-      "trajectory_amplitude_m", {0.04, 0.04, 0.025});
-    trajectory_frequency_ = vector_parameter(
-      "trajectory_frequency_hz", {0.05, 0.10, 0.05});
+      "trajectory_amplitude_m", {0.04, 0.04, 0.02});
+    trajectory_base_frequency_hz_ = declare_parameter("trajectory_base_frequency_hz", 0.05);
+    trajectory_roll_amplitude_rad_ =
+      declare_parameter("trajectory_roll_amplitude_deg", 8.0) * kPi / 180.0;
+    trajectory_pitch_amplitude_rad_ =
+      declare_parameter("trajectory_pitch_amplitude_deg", 6.0) * kPi / 180.0;
     trajectory_ramp_in_s_ = declare_parameter("trajectory_ramp_in_s", 3.0);
     if (publish_rate_hz_ <= 0.0 || translation_step_m_ <= 0.0 ||
-        rotation_step_rad_ <= 0.0 || trajectory_ramp_in_s_ < 0.0) {
+        rotation_step_rad_ <= 0.0 || trajectory_base_frequency_hz_ <= 0.0 ||
+        trajectory_roll_amplitude_rad_ < 0.0 || trajectory_pitch_amplitude_rad_ < 0.0 ||
+        trajectory_ramp_in_s_ < 0.0) {
       throw std::runtime_error("teleop rates and steps must be positive");
     }
     for (std::size_t i = 0; i < 3; ++i) {
       if (workspace_min_[i] >= workspace_max_[i]) {
         throw std::runtime_error("workspace_min must be below workspace_max");
+      }
+      if (trajectory_amplitude_[i] < 0.0) {
+        throw std::runtime_error("trajectory_amplitude_m must be non-negative");
       }
     }
 
@@ -246,8 +253,6 @@ class KeyboardTeleop final : public rclcpp::Node {
       case 'k': rotate_local(0, -rotation_step_rad_); break;
       case 'j': rotate_local(1, rotation_step_rad_); break;
       case 'l': rotate_local(1, -rotation_step_rad_); break;
-      case 'u': rotate_local(2, rotation_step_rad_); break;
-      case 'o': rotate_local(2, -rotation_step_rad_); break;
       case ' ': target_pose_ = measured_pose_; break;
       case 'p': print_target(); changed = false; break;
       default: changed = false; break;
@@ -286,13 +291,14 @@ class KeyboardTeleop final : public rclcpp::Node {
       SteadyClock::now() - trajectory_start_).count();
     const double ramp = quintic_ramp(elapsed, trajectory_ramp_in_s_);
     target_pose_ = trajectory_center_;
-    const double wx = 2.0 * kPi * trajectory_frequency_[0];
-    const double wy = 2.0 * kPi * trajectory_frequency_[1];
-    const double wz = 2.0 * kPi * trajectory_frequency_[2];
-    target_pose_.position.x += ramp * trajectory_amplitude_[0] * std::sin(wx * elapsed);
-    target_pose_.position.y += ramp * trajectory_amplitude_[1] * std::sin(wy * elapsed);
-    target_pose_.position.z += ramp * 0.5 * trajectory_amplitude_[2] *
-      (std::cos(wz * elapsed) - 1.0);
+    const double phase = 2.0 * kPi * trajectory_base_frequency_hz_ * elapsed;
+    target_pose_.position.x += ramp * trajectory_amplitude_[0] * std::sin(phase);
+    target_pose_.position.y += ramp * trajectory_amplitude_[1] * std::sin(2.0 * phase);
+    target_pose_.position.z += ramp * trajectory_amplitude_[2] * std::sin(3.0 * phase);
+    const double roll = ramp * trajectory_roll_amplitude_rad_ * std::sin(2.0 * phase);
+    const double pitch = ramp * trajectory_pitch_amplitude_rad_ * std::sin(3.0 * phase);
+    target_pose_.orientation = product(
+      product(trajectory_center_.orientation, axis_angle(0, roll)), axis_angle(1, pitch));
     clamp_position();
   }
 
@@ -324,11 +330,11 @@ class KeyboardTeleop final : public rclcpp::Node {
   }
 
   void print_target() const {
-    const auto rpy = quaternion_to_rpy(target_pose_.orientation);
+    const auto roll_pitch = quaternion_to_roll_pitch(target_pose_.orientation);
     RCLCPP_INFO(
-      get_logger(), "target xyz=[%.3f %.3f %.3f] m rpy=[%.1f %.1f %.1f] deg",
+      get_logger(), "target xyz=[%.3f %.3f %.3f] m roll/pitch=[%.1f %.1f] deg",
       target_pose_.position.x, target_pose_.position.y, target_pose_.position.z,
-      rpy[0] * 180.0 / kPi, rpy[1] * 180.0 / kPi, rpy[2] * 180.0 / kPi);
+      roll_pitch[0] * 180.0 / kPi, roll_pitch[1] * 180.0 / kPi);
   }
 
   void print_help() const {
@@ -336,9 +342,9 @@ class KeyboardTeleop final : public rclcpp::Node {
       get_logger(),
       "\nCHR temporary experiment keyboard\n"
       " EE xyz: W/S +X/-X, A/D +Y/-Y, R/F +Z/-Z\n"
-      " EE rpy: I/K +roll/-roll, J/L +pitch/-pitch, U/O +yaw/-yaw\n"
+      " EE tilt: I/K +roll/-roll, J/L +pitch/-pitch (tool-z yaw is free)\n"
       " Space: hold measured EE, P: print target\n"
-      " G: EE trajectory, B: DOB, M: arm experiment/DLS request\n"
+      " G: xyz+roll/pitch Lissajous, B: DOB, M: arm torque/DLS request\n"
       " Exit with Ctrl-C only after M is OFF and the vehicle is disarmed.\n"
       " NOTE: M-off stops DLS immediately; torque-off is deferred until disarm in flight.");
   }
@@ -346,11 +352,13 @@ class KeyboardTeleop final : public rclcpp::Node {
   double publish_rate_hz_{50.0};
   double translation_step_m_{0.01};
   double rotation_step_rad_{0.0523598776};
+  double trajectory_base_frequency_hz_{0.05};
+  double trajectory_roll_amplitude_rad_{0.1396263402};
+  double trajectory_pitch_amplitude_rad_{0.1047197551};
   double trajectory_ramp_in_s_{3.0};
   Vec3 workspace_min_{-2.0, -2.0, 0.05};
   Vec3 workspace_max_{2.0, 2.0, 3.0};
-  Vec3 trajectory_amplitude_{0.04, 0.04, 0.025};
-  Vec3 trajectory_frequency_{0.05, 0.10, 0.05};
+  Vec3 trajectory_amplitude_{0.04, 0.04, 0.02};
   std::vector<int32_t> flags_{0, 0, 0, 0, 0, 0};
   bool terminal_configured_{false};
   bool target_initialized_{false};

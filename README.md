@@ -48,7 +48,7 @@ J3 = -90..+90 degrees relative to the torque-on zero pose.
 위에서부터 체크한다.
 
 Start the non-interactive stack. This also starts rosbag immediately and saves
-the run under `src/data_logging/bags/YYYYMMDD_HHMMSS_chr`:
+the run under `src/data_logging/bags/rosbag2_YYYY_MM_DD-HH_MM_SS`:
 
 ```bash
 ros2 launch chr_controller temporary_experiment.launch.py
@@ -83,8 +83,9 @@ Recommended experiment order:
    Palletrone custom mode and DLS. The initial EE target is the measured pose,
    so enabling the controller does not request a step.
 7. If required for the run, enable DOB with `B`.
-8. First command a very small manual EE displacement and verify base and joint
-   directions. Then press `G` to run the conservative predefined EE path.
+8. First command a very small manual EE displacement/tilt and verify base and
+   joint directions. Then press `G` to run the single predefined Lissajous path
+   in xyz, roll, and pitch.
 9. Press `G` again to freeze the trajectory target. Press `M` to stop DLS;
    flight offsets slew back to zero while arm torque stays on during flight.
 10. Land and disarm using the normal flight procedure. The pending `M`-off
@@ -94,7 +95,10 @@ Recommended experiment order:
 
 The keyboard keeps the legacy six-field message layout as
 `[DOB, custom(auto), trajectory, 0, 0, arm_experiment_request]`. Only EE xyz,
-EE rpy, `Space`, `P`, `G`, `B`, and `M` are accepted as controls.
+EE roll/pitch, `Space`, `P`, `G`, `B`, and `M` are accepted as controls. `G`,
+`B`, and `M` respectively toggle the Lissajous trajectory, DOB, and arm/DLS
+experiment. EE local-z yaw (tool-axis twist) is not commanded or penalized by
+DLS. Palletrone base yaw remains an available output coordinate.
 
 ## Package ownership
 

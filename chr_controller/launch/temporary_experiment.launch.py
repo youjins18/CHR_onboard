@@ -23,7 +23,7 @@ def generate_launch_description():
     bag_output_root = str(
         Path.home() / "Desktop" / "chr_onboard_ws" / "src" / "data_logging" / "bags"
     )
-    bag_name = datetime.now().strftime("%Y%m%d_%H%M%S_chr")
+    bag_name = datetime.now().strftime("rosbag2_%Y_%m_%d-%H_%M_%S")
     bag_topics = [
         "/data_logging_msg",
         "/chr/data_logging_msg",

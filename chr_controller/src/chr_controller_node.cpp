@@ -422,7 +422,7 @@ class ChrController final : public rclcpp::Node {
     if (!acceptable) {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 1000,
-        "DLS rejected: position residual=%.4f m, orientation residual=%.4f rad",
+        "DLS rejected: position residual=%.4f m, tool-axis tilt residual=%.4f rad",
         result.position_residual_m, result.orientation_residual_rad);
       return false;
     }
