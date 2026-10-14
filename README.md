@@ -1,37 +1,35 @@
-# CHR onboard workspace
+# 🌲 Research Extension: CHR – Palletrone Aerial Manipulator
 
-Temporary aerial-manipulator experiment workspace combining the verified
-Palletrone onboard stack, OptiTrack external position, arm hardware, and CHR
-whole-body DLS kinematics.
+> Mobile Robotics Lab (MRL), Seoul National University of Science and Technology (Seoultech)
 
-## Process ownership
+> **Note**\
+> This ROS 2 workspace extends the **Palletrone**, a fully actuated multirotor
+> aerial robot, into the **Cone Harvest Robot (CHR)** by integrating a harvesting
+> arm, OptiTrack-based external position feedback, whole-body DLS inverse
+> kinematics, and experiment data logging.
 
-The experiment deliberately uses separate terminals instead of one monolithic
-launch file:
+The existing Palletrone flight controller and its validated operating procedure
+are preserved as much as possible. CHR commands are added through the existing
+ROS 2/PX4 interface rather than by restructuring the flight-control stack.
 
-1. Micro XRCE-DDS Agent
-2. Palletrone tilt Dynamixel (`quadrotor_controller/dynamixel_fix`)
-3. Palletrone flight + OptiTrack + flight bag
-4. Ground-station `chr_visualization`
-5. Arm Dynamixel + airborne zero capture + torque-on
-6. CHR controller + CHR/arm bag
-7. Keyboard EE command
+## Palletrone baseline
 
-`v3_optitrack_flight_launcher.launch.py` disables the legacy
-`custom_trajectory_generation` node. `chr_controller` is therefore the only
-publisher of PX4 custom position/velocity commands.
+- Fully actuated configuration with four thrusters and four tilt servos
+- Cascade position-attitude control architecture
+- Torque disturbance observer (DOB), enabled by default for this experiment
+- MOCE 2.0 model-based online center-of-mass estimation
+- Micro XRCE-DDS bridge between ROS 2 topics and PX4 uORB topics
 
-Arm torque belongs only to `dynamixel_arm_driver`. Starting
-`arm_driver.launch.py` during stable hover captures the hanging pose as
-`q=[0,0,0,0]`, writes the current position as the hold target, and then enables
-torque. The controller and keyboard never enable or disable torque. Keyboard
-starts with the arm/DLS experiment authorized and waits for `ARM_READY`; `M`
-acts as an emergency tracking inhibit/re-enable switch without changing arm
-torque.
+## CHR extensions
 
-Palletrone torque DOB is ON by default as soon as the terminal `#3` flight node
-starts. Terminal `#7` preserves that state. `B` remains available as an explicit
-DOB ON/OFF toggle.
+- OptiTrack rigid-body measurements forwarded to PX4 external vision
+- Dynamixel arm driver with airborne zero capture and hardware joint limits
+- Safety-gated whole-body DLS-IK for Palletrone XYZ and arm J1--J3 commands
+- TCP position and roll/pitch teleoperation with a predefined Lissajous path
+- Automatic DLS authorization after `ARM_READY`; `M` remains an emergency
+  tracking inhibit/re-enable switch and never changes arm torque
+- Separate flight and CHR rosbags with CSV conversion and MATLAB decryptors
+- Read-only RViz monitoring from the ground-station `chr_gsc_ws`
 
 ## Build
 
@@ -42,81 +40,32 @@ colcon build --symlink-install
 source install/setup.bash
 ```
 
-The OptiTrack stack requires the ROS 2 branch of IMRCLab
-`motion_capture_tracking`, including its submodules. See
-`src/px4_mocap_bridge/README.md` for installation and PX4 EKF2 settings.
+The OptiTrack integration requires the ROS 2 branch of IMRCLab
+`motion_capture_tracking`, including its submodules. Additional setup and PX4
+EKF2 requirements are documented in
+[`px4_mocap_bridge/README.md`](px4_mocap_bridge/README.md).
 
-## Terminal commands
+## Experiment operation
 
-Follow [EXPERIMENT_MANUAL_KO.md](EXPERIMENT_MANUAL_KO.md) for checks and exact
-timing. The process commands are:
+The complete terminal layout, startup sequence, keyboard controls, rosbag
+locations, shutdown procedure, and CSV/MATLAB workflow are maintained in the
+Korean experiment manual:
 
-```bash
-#1
-MicroXRCEAgent udp4 -p 8888
+**[EXPERIMENT_MANUAL_KO.md](EXPERIMENT_MANUAL_KO.md)**
 
-#2
-ros2 run quadrotor_controller dynamixel_fix
+Follow that manual in order during hardware experiments. In particular, start
+the arm driver only after stable hover, keep `chr_controller` as the sole PX4
+custom-command publisher, and stop DLS with `M` before landing.
 
-#3
-ros2 launch px4_mocap_bridge v3_optitrack_flight_launcher.launch.py \
-  hostname:=192.168.0.100 rigid_body_name:=drone
+## Main packages
 
-#4 (GSC, in ~/Desktop/chr_gsc_ws)
-ros2 launch chr_visualization chr_visualization.launch.py
-
-#5 (only after stable hover)
-ros2 launch dynamixel_arm_driver arm_driver.launch.py \
-  torque_on_at_startup:=true
-
-#6
-ros2 launch chr_controller temporary_experiment.launch.py
-
-#7
-ros2 run keyboard_teleop_chr keyboard_teleop \
-  --ros-args --params-file \
-  ~/Desktop/chr_onboard_ws/src/keyboard_teleop_chr/config/teleop.yaml
-```
-
-When terminal `#7` starts, no additional `M` input is required. The keyboard
-initializes the TCP target from feedback and authorizes the experiment. The
-controller waits until all of the following are true before it automatically
-enters whole-body DLS tracking:
-
-- current odometry, vehicle status, arm-joint feedback, and TCP target
-- Palletrone armed with no failsafe
-- arm Dynamixel torque enabled
-- stable hover for the configured duration
-- a valid captured command origin
-
-Press `M` once to inhibit DLS tracking and stop an active trajectory while
-leaving arm torque enabled. Press `M` again to re-authorize automatic tracking;
-the same safety gates must be satisfied again. `G` independently toggles the
-Lissajous TCP trajectory, and `B` toggles the Palletrone torque DOB.
-
-The arm feedback/command rate is 100 Hz. Limits relative to the airborne zero
-pose are J1 = -90..+90 degrees, J2 = 0..30 degrees, and J3 = -90..+90 degrees.
-
-## Recording
-
-Both bags use `~/Desktop/chr_onboard_ws/src/data_logging/bags`:
-
-- `palletrone_rosbag2_...`: starts in terminal #3; flight and OptiTrack data.
-- `chr_rosbag2_...`: starts in terminal #6; arm, TCP, DLS, and command data.
-
-Use `src/data_logging/rosbag_to_csv.py` on each bag separately, then use
-`Palletrone_Decryptor.m` for the flight CSV and `CHR_Decryptor.m` for the CHR
-CSV.
-
-## Package ownership
-
-- `px4_msgs`, `px4_ros_com`, and `px4-offboard`: validated Palletrone onboard
-  code; upstream contributor metadata is retained.
-- `px4_mocap_bridge`: OptiTrack reception and PX4 external-position bridge;
-  upstream contributor metadata is retained.
-- `quadrotor_controller`: Palletrone tilt Dynamixel control.
-- `DynamixelSDK`: validated Palletrone workspace version.
-- `dynamixel_arm_driver`: arm communication, zero capture, torque, feedback,
-  and hardware joint-limit enforcement.
-- `chr_controller`: frame conversion, safety gate, DLS-IK, and command routing.
-- `keyboard_teleop_chr`: EE target, Lissajous trajectory, DOB, and DLS toggle.
+- `chr_controller`: frame conversion, safety gates, whole-body DLS-IK, and
+  Palletrone/arm command routing
+- `dynamixel_arm_driver`: arm zero capture, torque ownership, feedback, and
+  hardware limit enforcement
+- `keyboard_teleop_chr`: TCP target, Lissajous trajectory, DOB toggle, and DLS
+  emergency inhibit/re-enable
+- `px4_mocap_bridge`: OptiTrack-to-PX4 external-position bridge
+- `px4_ros_com`, `px4_msgs`: validated Palletrone ROS 2/PX4 interface
+- `quadrotor_controller`: Palletrone tilt-servo control
+- `data_logging`: bag conversion and separate Palletrone/CHR MATLAB analysis

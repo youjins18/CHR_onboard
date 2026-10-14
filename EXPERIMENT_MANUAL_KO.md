@@ -36,7 +36,7 @@ alias agent='sudo chmod 666 /dev/tty* && MicroXRCEAgent serial --dev /dev/ttyPX4
 ```bash
 sshpal 
 cw
-alias chr_dyn='ros2 launch dynamixel_arm_driver dynamixel_driver.launch.py'
+alias dyn_fix='source /opt/ros/humble/setup.bash && source ~/chr_onboard_ws/install/local_setup.bash && ros2 run quadrotor_controller dynamixel_fix' ## 다이나믹셀
 ```
 
 ### #3 — Palletrone flight controller + OptiTrack + flight bag
