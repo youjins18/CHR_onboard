@@ -24,7 +24,6 @@
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include "std_msgs/msg/int32_multi_array.hpp"
 #include "std_msgs/msg/string.hpp"
-#include "std_srvs/srv/set_bool.hpp"
 
 namespace chr_controller {
 namespace {
@@ -35,7 +34,7 @@ constexpr char kWorldFrame[] = "world_enu";
 constexpr std::size_t kDobFlag = 0;
 constexpr std::size_t kCustomModeFlag = 1;
 constexpr std::size_t kTrajectoryFlag = 2;
-constexpr std::size_t kArmTorqueFlag = 5;
+constexpr std::size_t kExperimentEnableFlag = 5;
 
 bool finite_vector(const Eigen::Vector3d &value) { return value.allFinite(); }
 
@@ -95,7 +94,6 @@ class ChrController final : public rclcpp::Node {
       declare_parameter("maximum_velocity_feedforward_m_s", 0.30);
     maximum_yawrate_feedforward_ =
       declare_parameter("maximum_yawrate_feedforward_rad_s", 0.50);
-    allow_midair_torque_off_ = declare_parameter("allow_midair_torque_off", false);
     maximum_accepted_position_residual_ =
       declare_parameter("maximum_accepted_position_residual_m", 0.03);
     maximum_accepted_orientation_residual_ =
@@ -165,8 +163,6 @@ class ChrController final : public rclcpp::Node {
       "/chr/controller_state", rclcpp::QoS(1).transient_local().reliable());
     logging_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>(
       "/chr/data_logging_msg", rclcpp::SensorDataQoS());
-    torque_client_ = create_client<std_srvs::srv::SetBool>("/cone/set_torque");
-
     const auto period = std::chrono::duration<double>(1.0 / control_rate_hz_);
     control_timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(period),
@@ -176,7 +172,8 @@ class ChrController final : public rclcpp::Node {
     RCLCPP_INFO(
       get_logger(),
       "CHR controller ready. It is the sole publisher of PX4 custom commands; "
-      "do not run custom_trajectory_generation.");
+      "arm torque is owned by dynamixel_arm_driver; do not run "
+      "custom_trajectory_generation.");
   }
 
  private:
@@ -300,19 +297,21 @@ class ChrController final : public rclcpp::Node {
 
   void receive_flags(const std_msgs::msg::Int32MultiArray::SharedPtr message) {
     flags_ = message->data;
-    if (flags_.size() <= kArmTorqueFlag) flags_.resize(kArmTorqueFlag + 1, 0);
+    if (flags_.size() <= kExperimentEnableFlag) {
+      flags_.resize(kExperimentEnableFlag + 1, 0);
+    }
     if (!custom_mode_requested()) {
       origin_valid_ = false;
       tracking_active_ = false;
     }
-    if (!torque_requested()) tracking_active_ = false;
+    if (!experiment_enabled()) tracking_active_ = false;
   }
 
   bool flag(std::size_t index) const {
     return index < flags_.size() && flags_[index] != 0;
   }
   bool custom_mode_requested() const { return flag(kCustomModeFlag); }
-  bool torque_requested() const { return flag(kArmTorqueFlag); }
+  bool experiment_enabled() const { return flag(kExperimentEnableFlag); }
 
   bool fresh(const SteadyClock::time_point &time, double timeout) const {
     return Seconds(SteadyClock::now() - time).count() <= timeout;
@@ -346,52 +345,6 @@ class ChrController final : public rclcpp::Node {
     }
     hover_stable_ = Seconds(SteadyClock::now() - hover_candidate_since_).count() >=
       hover_stable_duration_s_;
-  }
-
-  void request_driver_torque(bool enable) {
-    if (torque_request_pending_) return;
-    if (!torque_client_->service_is_ready()) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000, "/cone/set_torque service is not ready");
-      return;
-    }
-    auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
-    request->data = enable;
-    torque_request_pending_ = true;
-    torque_client_->async_send_request(
-      request,
-      [this, enable](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
-        torque_request_pending_ = false;
-        const auto response = future.get();
-        if (!response->success) {
-          RCLCPP_ERROR(get_logger(), "torque request failed: %s", response->message.c_str());
-          return;
-        }
-        const bool rising_edge = enable && !torque_enabled_;
-        torque_enabled_ = enable;
-        if (enable) {
-          if (rising_edge) reset_after_torque_enable();
-        } else {
-          tracking_active_ = false;
-        }
-        RCLCPP_WARN(get_logger(), "%s", response->message.c_str());
-      });
-  }
-
-  void handle_torque_request() {
-    if (torque_requested() && !torque_enabled_) {
-      if (hover_stable_) request_driver_torque(true);
-      return;
-    }
-    if (!torque_requested() && torque_enabled_) {
-      if (!armed_ || allow_midair_torque_off_) {
-        request_driver_torque(false);
-      } else {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "mid-air torque-off denied; request remains pending until vehicle is disarmed");
-      }
-    }
   }
 
   void capture_command_origin() {
@@ -544,7 +497,7 @@ class ChrController final : public rclcpp::Node {
       set_state(State::Fault);
     } else if (!armed_ || !hover_stable_) {
       set_state(tracking_active_ ? State::Tracking : State::WaitingForHover);
-    } else if (torque_requested() && !torque_enabled_) {
+    } else if (experiment_enabled() && !torque_enabled_) {
       set_state(State::WaitingForTorque);
     } else if (tracking_active_) {
       set_state(State::Tracking);
@@ -560,7 +513,7 @@ class ChrController final : public rclcpp::Node {
     log.data.reserve(52);
     const auto push = [&log](double value) { log.data.push_back(static_cast<float>(value)); };
     push(static_cast<int>(state_));
-    push(armed_); push(hover_stable_); push(torque_requested()); push(torque_enabled_);
+    push(armed_); push(hover_stable_); push(experiment_enabled()); push(torque_enabled_);
     push(custom_mode_requested()); push(flag(kTrajectoryFlag)); push(flag(kDobFlag));
     for (Eigen::Index i = 0; i < 3; ++i) push(base_position_enu_[i]);
     push(WholeBodyKinematics::quaternion_yaw(base_orientation_enu_));
@@ -598,20 +551,18 @@ class ChrController final : public rclcpp::Node {
       0.25 * nominal_dt, 4.0 * nominal_dt);
     last_step_time_ = step_time;
     update_hover_gate();
-    handle_torque_request();
-
     if (custom_mode_requested() && odometry_received_ && !origin_valid_) {
       capture_command_origin();
     }
 
-    const bool may_enter_tracking = custom_mode_requested() && torque_requested() &&
+    const bool may_enter_tracking = custom_mode_requested() && experiment_enabled() &&
       torque_enabled_ && hover_stable_ && flight_healthy() && target_fresh() && origin_valid_;
     if (!tracking_active_ && may_enter_tracking) {
       tracking_active_ = true;
       RCLCPP_WARN(get_logger(), "WHOLE-BODY DLS TRACKING ENABLED");
     }
     if (tracking_active_ &&
-        (!custom_mode_requested() || !torque_requested() || !torque_enabled_ ||
+        (!custom_mode_requested() || !experiment_enabled() || !torque_enabled_ ||
          !flight_healthy() || !target_fresh())) {
       tracking_active_ = false;
       RCLCPP_WARN(get_logger(), "tracking stopped; holding arm and ramping PX4 offset to zero");
@@ -643,7 +594,6 @@ class ChrController final : public rclcpp::Node {
   double maximum_accepted_position_residual_{0.03};
   double maximum_accepted_orientation_residual_{0.15};
   bool publish_velocity_feedforward_{false};
-  bool allow_midair_torque_off_{false};
   bool armed_{false};
   bool failsafe_{false};
   bool odometry_received_{false};
@@ -651,7 +601,6 @@ class ChrController final : public rclcpp::Node {
   bool joint_state_received_{false};
   bool target_received_{false};
   bool torque_enabled_{false};
-  bool torque_request_pending_{false};
   bool hover_candidate_active_{false};
   bool hover_stable_{false};
   bool tracking_active_{false};
@@ -699,7 +648,6 @@ class ChrController final : public rclcpp::Node {
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr tcp_pose_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr controller_state_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr logging_pub_;
-  rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr torque_client_;
   rclcpp::TimerBase::SharedPtr control_timer_;
 };
 

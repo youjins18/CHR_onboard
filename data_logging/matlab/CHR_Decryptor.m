@@ -13,7 +13,7 @@ data = readtable(csv_file, 'VariableNamingRule', 'preserve');
 state = v(:, 1);
 armed = v(:, 2);
 hover = v(:, 3);
-torque_request = v(:, 4);
+experiment_enabled = v(:, 4);
 torque_enabled = v(:, 5);
 custom = v(:, 6);
 trajectory = v(:, 7);
@@ -90,10 +90,10 @@ stairs(t, [state, converged, tracking], 'LineWidth', 1.1);
 ylabel('state'); xlabel('time [s]'); grid on;
 legend('controller state', 'converged', 'tracking', 'Location', 'best');
 nexttile;
-stairs(t, [armed, hover, torque_request, torque_enabled, custom, trajectory, dob, ...
+stairs(t, [armed, hover, experiment_enabled, torque_enabled, custom, trajectory, dob, ...
     feedback_fresh, target_fresh], 'LineWidth', 1.0);
 ylabel('flags'); xlabel('time [s]'); ylim([-0.1, 1.1]); grid on;
-legend('armed', 'hover', 'torque req', 'torque', 'custom', 'trajectory', ...
+legend('armed', 'hover', 'experiment', 'torque', 'custom', 'trajectory', ...
     'DOB', 'feedback', 'target', 'Location', 'eastoutside');
 
 fprintf('CHR: %d samples, %.2f s, max J2 %.2f deg, max TCP error %.3f m\n', ...

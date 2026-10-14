@@ -78,6 +78,12 @@ class KeyboardTeleop final : public rclcpp::Node {
  public:
   KeyboardTeleop() : Node("keyboard_teleop_chr") {
     publish_rate_hz_ = declare_parameter("publish_rate_hz", 50.0);
+    const bool dob_enabled_at_startup =
+      declare_parameter("dob_enabled_at_startup", true);
+    const bool experiment_enabled_at_startup =
+      declare_parameter("experiment_enabled_at_startup", true);
+    flags_[0] = dob_enabled_at_startup ? 1 : 0;
+    flags_[5] = experiment_enabled_at_startup ? 1 : 0;
     translation_step_m_ = declare_parameter("translation_step_m", 0.01);
     rotation_step_rad_ = declare_parameter("rotation_step_deg", 3.0) * kPi / 180.0;
     workspace_min_ = vector_parameter("workspace_min", {-2.0, -2.0, 0.05});
@@ -125,6 +131,10 @@ class KeyboardTeleop final : public rclcpp::Node {
       std::chrono::duration_cast<std::chrono::nanoseconds>(period),
       std::bind(&KeyboardTeleop::update, this));
     print_help();
+    RCLCPP_WARN(
+      get_logger(),
+      "startup defaults: DOB=%s, arm/DLS experiment=%s; M inhibits or re-enables tracking",
+      flags_[0] ? "ON" : "OFF", flags_[5] ? "AUTO-ENABLE" : "OFF");
     RCLCPP_INFO(get_logger(), "waiting for /chr/state/tcp_pose before EE commands");
   }
 
@@ -275,7 +285,7 @@ class KeyboardTeleop final : public rclcpp::Node {
       flags_[1] = torque_enabled_ && controller_state_ == "ARM_READY" ? 1 : 0;
       RCLCPP_WARN(
         get_logger(),
-        "arm experiment request = ON; torque will enable after hover, then DLS will start at ARM_READY");
+        "arm/DLS experiment = ON; waiting for arm torque and ARM_READY if needed");
       return;
     }
     flags_[1] = 0;
@@ -283,7 +293,7 @@ class KeyboardTeleop final : public rclcpp::Node {
     trajectory_enabled_ = false;
     RCLCPP_WARN(
       get_logger(),
-      "arm experiment request = OFF; DLS stopped, torque-off remains deferred until disarm");
+      "arm/DLS experiment = OFF; DLS stopped, arm torque remains owned by the driver");
   }
 
   void update_trajectory() {
@@ -344,9 +354,10 @@ class KeyboardTeleop final : public rclcpp::Node {
       " EE xyz: W/S +X/-X, A/D +Y/-Y, R/F +Z/-Z\n"
       " EE tilt: I/K +roll/-roll, J/L +pitch/-pitch (tool-z yaw is free)\n"
       " Space: hold measured EE, P: print target\n"
-      " G: xyz+roll/pitch Lissajous, B: DOB, M: arm torque/DLS request\n"
-      " Exit with Ctrl-C only after M is OFF and the vehicle is disarmed.\n"
-      " NOTE: M-off stops DLS immediately; torque-off is deferred until disarm in flight.");
+      " G: xyz+roll/pitch Lissajous, B: DOB\n"
+      " M: emergency DLS inhibit/re-enable (arm torque is unchanged)\n"
+      " DLS auto-starts only after the controller reports ARM_READY.\n"
+      " Exit with Ctrl-C after M is OFF.");
   }
 
   double publish_rate_hz_{50.0};

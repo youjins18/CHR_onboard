@@ -1,6 +1,10 @@
 keyboard_teleop_chr:
   ros__parameters:
     publish_rate_hz: 50.0
+    # Keep flight DOB enabled and arm/DLS experiment armed when teleop starts.
+    # Actual DLS tracking still waits for every chr_controller safety gate.
+    dob_enabled_at_startup: true
+    experiment_enabled_at_startup: true
     translation_step_m: 0.01
     rotation_step_deg: 3.0
     workspace_min: [-2.0, -2.0, 0.05]
@@ -8,8 +12,8 @@ keyboard_teleop_chr:
 
     # One closed Lissajous trajectory around the EE pose at the G-key event.
     # Position frequencies use the 1:2:3 ratio. EE local-z yaw is unconstrained.
-    trajectory_amplitude_m: [0.04, 0.04, 0.02]
-    trajectory_base_frequency_hz: 0.05
-    trajectory_roll_amplitude_deg: 8.0
-    trajectory_pitch_amplitude_deg: 6.0
-    trajectory_ramp_in_s: 3.0
+    trajectory_amplitude_m: [0.02, 0.02, 0.01]
+    trajectory_base_frequency_hz: 0.03
+    trajectory_roll_amplitude_deg: 4.0
+    trajectory_pitch_amplitude_deg: 4.0
+    trajectory_ramp_in_s: 5.0

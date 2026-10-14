@@ -31,6 +31,3 @@ chr_controller:
     publish_velocity_feedforward: false
     maximum_velocity_feedforward_m_s: 0.30
     maximum_yawrate_feedforward_rad_s: 0.50
-
-    # Mid-air torque-off can make the hanging arm fall and disturb the aircraft.
-    allow_midair_torque_off: false

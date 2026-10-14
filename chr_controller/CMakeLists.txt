@@ -15,7 +15,6 @@ find_package(px4_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
-find_package(std_srvs REQUIRED)
 
 add_library(chr_kinematics
   src/whole_body_kinematics.cpp
@@ -28,7 +27,7 @@ target_link_libraries(chr_kinematics Eigen3::Eigen)
 add_executable(chr_controller_node src/chr_controller_node.cpp)
 target_link_libraries(chr_controller_node chr_kinematics Eigen3::Eigen)
 ament_target_dependencies(
-  chr_controller_node geometry_msgs px4_msgs rclcpp sensor_msgs std_msgs std_srvs)
+  chr_controller_node geometry_msgs px4_msgs rclcpp sensor_msgs std_msgs)
 
 install(TARGETS chr_kinematics chr_controller_node
   EXPORT export_chr_kinematics
