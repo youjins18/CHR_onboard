@@ -12,12 +12,20 @@ data = readtable(csv_file, 'VariableNamingRule', 'preserve');
 
 position = v(:, 1:3);
 position_command = v(:, 4:6);
+velocity = v(:, 7:9);
+velocity_command = v(:, 10:12);
 attitude = v(:, 13:15);
 attitude_command = v(:, 16:18);
+angular_velocity = v(:, 19:21);
+angular_velocity_command = v(:, 22:24);
+force_command = v(:, 25:27);
 torque_command = v(:, 28:30);
 dob_torque = v(:, 32:34);
+rotor_thrust = v(:, 35:38);
 servo = v(:, 39:43);
 servo_command = v(:, 44:48);
+acceleration = v(:, 49:51);
+acceleration_command = v(:, 52:54);
 motor_percent = 100 * max(0, min(1, v(:, 71:74)));
 
 figure('Name', 'Palletrone flight control', 'Color', 'w');
@@ -58,6 +66,43 @@ plot(t, rad2deg(servo_command), '--', 'LineWidth', 1.0);
 ylabel('servo [deg]'); xlabel('time [s]'); grid on;
 legend('S1', 'S2', 'S3', 'S4', 'payload', ...
     'S1 cmd', 'S2 cmd', 'S3 cmd', 'S4 cmd', 'payload cmd', 'Location', 'eastoutside');
+
+figure('Name', 'Palletrone motion and allocation', 'Color', 'w');
+tiledlayout(4, 3, 'TileSpacing', 'compact');
+
+for index = 1:3
+    nexttile;
+    plot(t, velocity(:, index), 'LineWidth', 1.2); hold on;
+    plot(t, velocity_command(:, index), '--', 'LineWidth', 1.2);
+    ylabel(sprintf('v_%s [m/s]', lower(axis_name{index}))); grid on;
+    legend('measured', 'command', 'Location', 'best');
+end
+
+for index = 1:3
+    nexttile;
+    plot(t, rad2deg(angular_velocity(:, index)), 'LineWidth', 1.2); hold on;
+    plot(t, rad2deg(angular_velocity_command(:, index)), '--', 'LineWidth', 1.2);
+    ylabel(sprintf('%s rate [deg/s]', attitude_name{index})); grid on;
+    legend('measured', 'command', 'Location', 'best');
+end
+
+for index = 1:3
+    nexttile;
+    plot(t, acceleration(:, index), 'LineWidth', 1.2); hold on;
+    plot(t, acceleration_command(:, index), '--', 'LineWidth', 1.2);
+    ylabel(sprintf('a_%s [m/s^2]', lower(axis_name{index}))); xlabel('time [s]'); grid on;
+    legend('measured', 'command', 'Location', 'best');
+end
+
+nexttile;
+plot(t, force_command, 'LineWidth', 1.1);
+ylabel('force command [N]'); xlabel('time [s]'); grid on;
+legend('F_x', 'F_y', 'F_z', 'Location', 'best');
+
+nexttile([1, 2]);
+plot(t, rotor_thrust, 'LineWidth', 1.1);
+ylabel('rotor thrust [N]'); xlabel('time [s]'); grid on;
+legend('f_1', 'f_2', 'f_3', 'f_4', 'Location', 'best');
 
 fprintf('Palletrone: %d samples, %.2f s, maximum motor output %.1f %%\n', ...
     size(v, 1), t(end) - t(1), max(motor_percent, [], 'all'));

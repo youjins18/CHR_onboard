@@ -36,7 +36,7 @@ alias agent='sudo chmod 666 /dev/tty* && MicroXRCEAgent serial --dev /dev/ttyPX4
 ```bash
 sshpal 
 cw
-alias dyn_fix='source /opt/ros/humble/setup.bash && source ~/chr_onboard_ws/install/local_setup.bash && ros2 run quadrotor_controller dynamixel_fix' ## 다이나믹셀
+alias dyn_fix='ros2 run quadrotor_controller dynamixel_fix' 
 ```
 
 ### #3 — Palletrone flight controller + OptiTrack + flight bag
@@ -44,7 +44,7 @@ alias dyn_fix='source /opt/ros/humble/setup.bash && source ~/chr_onboard_ws/inst
 ```bash
 sshpal 
 cw
-alias chr_pt='os2 launch px4_mocap_bridge v3_optitrack_flight_launcher.launch.py'
+alias chr_pt='ros2 launch px4_mocap_bridge v3_optitrack_flight_launcher.launch.py'
 ```
 
 이 launch가 실행하는 것은 다음뿐이다.
@@ -142,7 +142,7 @@ python3 rosbag_to_csv.py bags/chr_rosbag2_YYYY_MM_DD-HH_MM_SS/
 
 파일 가져오기 
 ```bash
-scp palletrone2@192.168.10.129:~/rosbag2_2026_01_13-23_17_19/data.csv ~/Desktop/rosbag2csv/ 
+scp palletrone2@192.168.10.129:~/rosbag2_2026_01_13-23_17_19/data.csv ~/Desktop/chr_onboard_ws/src/data_logging/bags/
 ```
 
 - Flight CSV: `matlab/Palletrone_Decryptor.m`
