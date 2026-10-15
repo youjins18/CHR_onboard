@@ -651,7 +651,7 @@ private:
 	float com_lpf_x = 0.f, com_lpf_y = 0.f, com_lpf_z = 0.f;
 	float com_update_x = 0.f, com_update_y = 0.f, com_update_z = 0.f;	
 
-	int dob_flag = 1; int custom_mode_flag = 0;	int trajectory_flag = 0; int payload_flag = 0; int l1_adaptive_flag = 0;
+	int dob_flag = 0; int custom_mode_flag = 0;	int trajectory_flag = 0; int payload_flag = 0; int l1_adaptive_flag = 0;
 	
 	float pos_PID_dt = 0.f, vel_PID_dt = 0.f, att_PID_dt = 0.f, rate_PID_dt = 0.f, allo_PID_dt = 0.f, dob_PID_dt = 0.f, com_PID_dt = 0.f;
 

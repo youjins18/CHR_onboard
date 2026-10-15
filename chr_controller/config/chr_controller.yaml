@@ -21,7 +21,7 @@ chr_controller:
     joint_names: [J1, J2, J3]
     joint_lower_rad: [-1.5708, 0.0, -1.5708]
     joint_upper_rad: [1.5708, 0.5235987756, 1.5708]
-    maximum_joint_speed_rad_s: [0.35, 0.20, 0.35]
+    maximum_joint_speed_rad_s: [1.00, 1.00, 1.00]
 
     hover_linear_speed_threshold_m_s: 0.15
     hover_angular_speed_threshold_rad_s: 0.20

@@ -58,6 +58,7 @@ def rows(bag_path: Path, storage_id: str) -> Iterator[dict[str, Any]]:
             ) from error
         topic_types[topic.name] = (topic.type, message_class)
 
+    failed_topics: set[str] = set()
     first_timestamp = None
     while reader.has_next():
         topic, serialized, timestamp = reader.read_next()
@@ -70,7 +71,19 @@ def rows(bag_path: Path, storage_id: str) -> Iterator[dict[str, Any]]:
             "topic": topic,
             "message_type": type_name,
         }
-        row.update(flatten_message(deserialize_message(serialized, message_class)))
+        try:
+            message = deserialize_message(serialized, message_class)
+        except Exception as error:
+            if topic not in failed_topics:
+                print(
+                    f"WARNING: skipping messages that cannot be deserialized: "
+                    f"{topic} ({type_name})\n  {error}",
+                    file=sys.stderr,
+                )
+                failed_topics.add(topic)
+            continue
+
+        row.update(flatten_message(message))
         yield row
 
 

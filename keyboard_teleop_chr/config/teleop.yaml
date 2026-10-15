@@ -3,7 +3,7 @@ keyboard_teleop_chr:
     publish_rate_hz: 50.0
     # Keep flight DOB enabled and arm/DLS experiment armed when teleop starts.
     # Actual DLS tracking still waits for every chr_controller safety gate.
-    dob_enabled_at_startup: true
+    dob_enabled_at_startup: false
     experiment_enabled_at_startup: true
     translation_step_m: 0.01
     rotation_step_deg: 3.0
