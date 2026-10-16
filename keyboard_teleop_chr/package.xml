@@ -2,7 +2,7 @@
 <package format="3">
   <name>keyboard_teleop_chr</name>
   <version>0.1.0</version>
-  <description>Keyboard EE command, trajectory generator, and experiment flag publisher for CHR.</description>
+  <description>Keyboard EE command and predefined-trajectory flag publisher for CHR.</description>
   <maintainer email="chldbwls08@seoultech.ac.kr">youjins18</maintainer>
   <license>Apache-2.0</license>
 

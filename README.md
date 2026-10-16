@@ -24,10 +24,13 @@ ROS 2/PX4 interface rather than by restructuring the flight-control stack.
 
 - OptiTrack rigid-body measurements forwarded to PX4 external vision
 - Dynamixel arm driver with airborne zero capture and hardware joint limits
-- Safety-gated whole-body DLS-IK for Palletrone XYZ and arm J1--J3 commands
-- TCP position and roll/pitch teleoperation with a predefined Lissajous path
-- Automatic DLS authorization after `ARM_READY`; `M` remains an emergency
-  tracking inhibit/re-enable switch and never changes arm torque
+- Safety-gated manual whole-body DLS-IK for Palletrone XYZ and arm J1--J3
+  commands
+- TCP position/roll/pitch teleoperation plus a configurable arm-init and
+  Palletrone X/Z diagonal trajectory
+- Automatic custom-mode authorization after `ARM_READY`; `G` starts the
+  predefined motion and `M` remains an emergency inhibit/re-enable switch
+  that never changes arm torque
 - Separate flight and CHR rosbags with CSV conversion and MATLAB decryptors
 - Read-only RViz monitoring from the ground-station `chr_gsc_ws`
 
@@ -55,16 +58,16 @@ Korean experiment manual:
 
 Follow that manual in order during hardware experiments. In particular, start
 the arm driver only after stable hover, keep `chr_controller` as the sole PX4
-custom-command publisher, and stop DLS with `M` before landing.
+custom-command publisher, and stop motion with `M` before landing.
 
 ## Main packages
 
-- `chr_controller`: frame conversion, safety gates, whole-body DLS-IK, and
-  Palletrone/arm command routing
+- `chr_controller`: frame conversion, safety gates, manual whole-body DLS-IK,
+  configurable arm-init/base-diagonal trajectory, and command routing
 - `dynamixel_arm_driver`: arm zero capture, torque ownership, feedback, and
   hardware limit enforcement
-- `keyboard_teleop_chr`: TCP target, Lissajous trajectory, DOB toggle, and DLS
-  emergency inhibit/re-enable
+- `keyboard_teleop_chr`: TCP target, predefined trajectory toggle, DOB toggle,
+  and motion emergency inhibit/re-enable
 - `px4_mocap_bridge`: OptiTrack-to-PX4 external-position bridge
 - `px4_ros_com`, `px4_msgs`: validated Palletrone ROS 2/PX4 interface
 - `quadrotor_controller`: Palletrone tilt-servo control

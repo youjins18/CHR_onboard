@@ -31,10 +31,12 @@ using SteadyClock = std::chrono::steady_clock;
 using Seconds = std::chrono::duration<double>;
 
 constexpr char kWorldFrame[] = "world_enu";
+constexpr double kPi = 3.14159265358979323846;
 constexpr std::size_t kDobFlag = 0;
 constexpr std::size_t kCustomModeFlag = 1;
 constexpr std::size_t kTrajectoryFlag = 2;
 constexpr std::size_t kExperimentEnableFlag = 5;
+constexpr std::size_t kManualDlsFlag = 6;
 
 bool finite_vector(const Eigen::Vector3d &value) { return value.allFinite(); }
 
@@ -109,6 +111,18 @@ class ChrController final : public rclcpp::Node {
     if (joint_names_.size() != 3) throw std::runtime_error("joint_names must have three entries");
     kinematics_ = std::make_unique<WholeBodyKinematics>(lower, upper);
 
+    const auto trajectory_init_pose_deg = vector3_parameter(
+      *this, "trajectory_init_pose_deg", {0.0, 3.0, 45.0});
+    trajectory_init_pose_ = trajectory_init_pose_deg * (kPi / 180.0);
+    trajectory_init_tolerance_rad_ =
+      declare_parameter("trajectory_init_tolerance_deg", 2.0) * kPi / 180.0;
+    trajectory_init_settle_s_ = declare_parameter("trajectory_init_settle_s", 0.5);
+    trajectory_x_displacement_m_ =
+      declare_parameter("trajectory_x_displacement_m", 0.50);
+    trajectory_z_displacement_m_ =
+      declare_parameter("trajectory_z_displacement_m", -0.50);
+    trajectory_frequency_hz_ = declare_parameter("trajectory_frequency_hz", 0.03);
+
     ik_options_.damping = declare_parameter("dls_damping", 0.03);
     ik_options_.position_tolerance_m =
       declare_parameter("dls_position_tolerance_m", 0.0005);
@@ -172,8 +186,8 @@ class ChrController final : public rclcpp::Node {
     RCLCPP_INFO(
       get_logger(),
       "CHR controller ready. It is the sole publisher of PX4 custom commands; "
-      "arm torque is owned by dynamixel_arm_driver; do not run "
-      "custom_trajectory_generation.");
+      "G runs the configured joint-init/base-diagonal trajectory without DLS; "
+      "arm torque is owned by dynamixel_arm_driver.");
   }
 
  private:
@@ -183,8 +197,17 @@ class ChrController final : public rclcpp::Node {
     WaitingForTorque = 2,
     ArmReady = 3,
     Tracking = 4,
-    Hold = 5,
-    Fault = 6,
+    ArmInit = 5,
+    BaseTrajectory = 6,
+    Hold = 7,
+    Fault = 8,
+  };
+
+  enum class TrajectoryPhase : int {
+    Idle = 0,
+    ArmInit = 1,
+    BaseMotion = 2,
+    Hold = 3,
   };
 
   static const char *state_name(State state) {
@@ -194,6 +217,8 @@ class ChrController final : public rclcpp::Node {
       case State::WaitingForTorque: return "WAITING_FOR_TORQUE";
       case State::ArmReady: return "ARM_READY";
       case State::Tracking: return "TRACKING";
+      case State::ArmInit: return "ARM_INIT";
+      case State::BaseTrajectory: return "BASE_TRAJECTORY";
       case State::Hold: return "HOLD";
       case State::Fault: return "FAULT";
     }
@@ -204,8 +229,22 @@ class ChrController final : public rclcpp::Node {
     if (control_rate_hz_ <= 0.0 || feedback_timeout_s_ <= 0.0 ||
         status_timeout_s_ <= 0.0 || target_timeout_s_ <= 0.0 ||
         hover_stable_duration_s_ < 0.0 || maximum_base_command_speed_ <= 0.0 ||
-        maximum_yaw_command_speed_ <= 0.0 || !(maximum_joint_speed_.array() > 0.0).all()) {
+        maximum_yaw_command_speed_ <= 0.0 || !(maximum_joint_speed_.array() > 0.0).all() ||
+        trajectory_init_tolerance_rad_ <= 0.0 || trajectory_init_settle_s_ < 0.0 ||
+        trajectory_frequency_hz_ <= 0.0 ||
+        !std::isfinite(trajectory_x_displacement_m_) ||
+        !std::isfinite(trajectory_z_displacement_m_)) {
       throw std::runtime_error("invalid non-positive controller parameter");
+    }
+    if ((trajectory_init_pose_.array() < kinematics_->joint_lower().array()).any() ||
+        (trajectory_init_pose_.array() > kinematics_->joint_upper().array()).any()) {
+      throw std::runtime_error("trajectory_init_pose_deg exceeds configured joint limits");
+    }
+    const double peak_axis_speed = kPi * trajectory_frequency_hz_ * std::max(
+      std::abs(trajectory_x_displacement_m_), std::abs(trajectory_z_displacement_m_));
+    if (peak_axis_speed > maximum_base_command_speed_) {
+      throw std::runtime_error(
+        "configured diagonal trajectory exceeds maximum_base_command_speed_m_s");
     }
   }
 
@@ -271,11 +310,16 @@ class ChrController final : public rclcpp::Node {
     const bool rising_edge = message->data && !torque_enabled_;
     torque_enabled_ = message->data;
     if (rising_edge) reset_after_torque_enable();
-    if (!torque_enabled_) tracking_active_ = false;
+    if (!torque_enabled_) {
+      tracking_active_ = false;
+      trajectory_phase_ = TrajectoryPhase::Idle;
+    }
   }
 
   void reset_after_torque_enable() {
     tracking_active_ = false;
+    trajectory_phase_ = TrajectoryPhase::Idle;
+    trajectory_init_candidate_active_ = false;
     hover_candidate_active_ = false;
     hover_stable_ = false;
     arm_command_initialized_ = false;
@@ -297,21 +341,27 @@ class ChrController final : public rclcpp::Node {
 
   void receive_flags(const std_msgs::msg::Int32MultiArray::SharedPtr message) {
     flags_ = message->data;
-    if (flags_.size() <= kExperimentEnableFlag) {
-      flags_.resize(kExperimentEnableFlag + 1, 0);
+    if (flags_.size() <= kManualDlsFlag) {
+      flags_.resize(kManualDlsFlag + 1, 0);
     }
     if (!custom_mode_requested()) {
       origin_valid_ = false;
       tracking_active_ = false;
+      trajectory_phase_ = TrajectoryPhase::Idle;
     }
-    if (!experiment_enabled()) tracking_active_ = false;
+    if (!experiment_enabled()) {
+      tracking_active_ = false;
+      trajectory_phase_ = TrajectoryPhase::Idle;
+    }
   }
 
   bool flag(std::size_t index) const {
     return index < flags_.size() && flags_[index] != 0;
   }
   bool custom_mode_requested() const { return flag(kCustomModeFlag); }
+  bool trajectory_requested() const { return flag(kTrajectoryFlag); }
   bool experiment_enabled() const { return flag(kExperimentEnableFlag); }
+  bool manual_dls_requested() const { return flag(kManualDlsFlag); }
 
   bool fresh(const SteadyClock::time_point &time, double timeout) const {
     return Seconds(SteadyClock::now() - time).count() <= timeout;
@@ -360,6 +410,91 @@ class ChrController final : public rclcpp::Node {
       get_logger(), "captured custom-command origin ENU=[%.3f %.3f %.3f], yaw=%.3f",
       origin_position_enu_.x(), origin_position_enu_.y(), origin_position_enu_.z(),
       origin_yaw_enu_);
+  }
+
+  bool trajectory_motion_active() const {
+    return trajectory_phase_ == TrajectoryPhase::ArmInit ||
+      trajectory_phase_ == TrajectoryPhase::BaseMotion;
+  }
+
+  void start_predefined_trajectory() {
+    tracking_active_ = false;
+    trajectory_phase_ = TrajectoryPhase::ArmInit;
+    trajectory_init_candidate_active_ = false;
+    trajectory_base_origin_offset_ned_ = base_offset_command_ned_;
+    trajectory_hold_yaw_offset_ned_ = yaw_offset_command_ned_;
+    RCLCPP_WARN(
+      get_logger(),
+      "PREDEFINED TRAJECTORY: ARM_INIT target=[%.1f %.1f %.1f] deg",
+      trajectory_init_pose_[0] * 180.0 / kPi,
+      trajectory_init_pose_[1] * 180.0 / kPi,
+      trajectory_init_pose_[2] * 180.0 / kPi);
+  }
+
+  void hold_predefined_trajectory() {
+    if (trajectory_phase_ == TrajectoryPhase::Idle ||
+        trajectory_phase_ == TrajectoryPhase::Hold) {
+      return;
+    }
+    trajectory_phase_ = TrajectoryPhase::Hold;
+    trajectory_init_candidate_active_ = false;
+    RCLCPP_WARN(
+      get_logger(),
+      "PREDEFINED TRAJECTORY OFF: holding current base offset and arm command");
+  }
+
+  void update_predefined_trajectory(double dt) {
+    if (trajectory_phase_ == TrajectoryPhase::ArmInit) {
+      for (Eigen::Index joint = 0; joint < 3; ++joint) {
+        arm_command_[joint] = move_toward(
+          arm_command_[joint], trajectory_init_pose_[joint],
+          maximum_joint_speed_[joint] * dt);
+      }
+      arm_command_ = kinematics_->clamp_joints(arm_command_);
+      base_offset_command_ned_ = trajectory_base_origin_offset_ned_;
+      yaw_offset_command_ned_ = trajectory_hold_yaw_offset_ned_;
+
+      const bool pose_reached =
+        (joint_position_ - trajectory_init_pose_).cwiseAbs().maxCoeff() <=
+        trajectory_init_tolerance_rad_;
+      if (!pose_reached) {
+        trajectory_init_candidate_active_ = false;
+        return;
+      }
+      if (!trajectory_init_candidate_active_) {
+        trajectory_init_candidate_active_ = true;
+        trajectory_init_candidate_since_ = SteadyClock::now();
+        return;
+      }
+      if (Seconds(SteadyClock::now() - trajectory_init_candidate_since_).count() <
+          trajectory_init_settle_s_) {
+        return;
+      }
+
+      trajectory_phase_ = TrajectoryPhase::BaseMotion;
+      trajectory_start_time_ = SteadyClock::now();
+      trajectory_base_origin_offset_ned_ = base_offset_command_ned_;
+      RCLCPP_WARN(
+        get_logger(),
+        "PREDEFINED TRAJECTORY: BASE_DIAGONAL x=%.3f m, z=%.3f m, f=%.3f Hz",
+        trajectory_x_displacement_m_, trajectory_z_displacement_m_,
+        trajectory_frequency_hz_);
+      return;
+    }
+
+    if (trajectory_phase_ == TrajectoryPhase::BaseMotion) {
+      const double elapsed = Seconds(SteadyClock::now() - trajectory_start_time_).count();
+      const double phase = 2.0 * kPi * trajectory_frequency_hz_ * elapsed;
+      const double blend = 0.5 * (1.0 - std::cos(phase));
+      const Eigen::Vector3d displacement_enu(
+        trajectory_x_displacement_m_ * blend,
+        0.0,
+        trajectory_z_displacement_m_ * blend);
+      base_offset_command_ned_ = trajectory_base_origin_offset_ned_ +
+        Px4FrameAdapter::enu_to_ned(displacement_enu);
+      yaw_offset_command_ned_ = trajectory_hold_yaw_offset_ned_;
+      arm_command_ = trajectory_init_pose_;
+    }
   }
 
   bool solve_target(double dt) {
@@ -495,12 +630,18 @@ class ChrController final : public rclcpp::Node {
       set_state(State::WaitingForFeedback);
     } else if (failsafe_) {
       set_state(State::Fault);
-    } else if (!armed_ || !hover_stable_) {
-      set_state(tracking_active_ ? State::Tracking : State::WaitingForHover);
     } else if (experiment_enabled() && !torque_enabled_) {
       set_state(State::WaitingForTorque);
+    } else if (trajectory_phase_ == TrajectoryPhase::ArmInit) {
+      set_state(State::ArmInit);
+    } else if (trajectory_phase_ == TrajectoryPhase::BaseMotion) {
+      set_state(State::BaseTrajectory);
+    } else if (trajectory_phase_ == TrajectoryPhase::Hold) {
+      set_state(State::Hold);
     } else if (tracking_active_) {
       set_state(State::Tracking);
+    } else if (!armed_ || !hover_stable_) {
+      set_state(State::WaitingForHover);
     } else if (torque_enabled_) {
       set_state(State::ArmReady);
     } else {
@@ -510,7 +651,7 @@ class ChrController final : public rclcpp::Node {
 
   void publish_log() {
     std_msgs::msg::Float32MultiArray log;
-    log.data.reserve(52);
+    log.data.reserve(53);
     const auto push = [&log](double value) { log.data.push_back(static_cast<float>(value)); };
     push(static_cast<int>(state_));
     push(armed_); push(hover_stable_); push(experiment_enabled()); push(torque_enabled_);
@@ -538,7 +679,8 @@ class ChrController final : public rclcpp::Node {
     push(last_ik_result_.converged);
     for (Eigen::Index i = 0; i < 3; ++i) push(base_offset_command_ned_[i]);
     push(yaw_offset_command_ned_);
-    push(feedback_fresh()); push(target_fresh()); push(tracking_active_);
+    push(feedback_fresh()); push(target_fresh());
+    push(tracking_active_ || trajectory_motion_active());
     for (Eigen::Index i = 0; i < 3; ++i) push(base_velocity_enu_[i]);
     push(angular_velocity_norm_);
     logging_pub_->publish(log);
@@ -555,23 +697,53 @@ class ChrController final : public rclcpp::Node {
       capture_command_origin();
     }
 
-    const bool may_enter_tracking = custom_mode_requested() && experiment_enabled() &&
-      torque_enabled_ && hover_stable_ && flight_healthy() && target_fresh() && origin_valid_;
+    const bool ready_to_start_motion = custom_mode_requested() && experiment_enabled() &&
+      torque_enabled_ && hover_stable_ && flight_healthy() && origin_valid_;
+    const bool safe_to_continue_motion = custom_mode_requested() && experiment_enabled() &&
+      torque_enabled_ && flight_healthy() && origin_valid_;
+
+    if (trajectory_requested()) {
+      if ((trajectory_phase_ == TrajectoryPhase::Idle ||
+           trajectory_phase_ == TrajectoryPhase::Hold) && ready_to_start_motion) {
+        start_predefined_trajectory();
+      }
+    } else {
+      hold_predefined_trajectory();
+    }
+
+    if (trajectory_motion_active() && !safe_to_continue_motion) {
+      trajectory_phase_ = TrajectoryPhase::Idle;
+      trajectory_init_candidate_active_ = false;
+      RCLCPP_ERROR(
+        get_logger(),
+        "predefined trajectory aborted by flight/torque/experiment safety gate");
+    }
+
+    if (trajectory_phase_ == TrajectoryPhase::Hold && manual_dls_requested()) {
+      trajectory_phase_ = TrajectoryPhase::Idle;
+    }
+
+    const bool may_enter_tracking = manual_dls_requested() &&
+      trajectory_phase_ == TrajectoryPhase::Idle && ready_to_start_motion && target_fresh();
     if (!tracking_active_ && may_enter_tracking) {
       tracking_active_ = true;
-      RCLCPP_WARN(get_logger(), "WHOLE-BODY DLS TRACKING ENABLED");
+      RCLCPP_WARN(get_logger(), "MANUAL WHOLE-BODY DLS TRACKING ENABLED");
     }
     if (tracking_active_ &&
-        (!custom_mode_requested() || !experiment_enabled() || !torque_enabled_ ||
-         !flight_healthy() || !target_fresh())) {
+        (!manual_dls_requested() || trajectory_phase_ != TrajectoryPhase::Idle ||
+         !safe_to_continue_motion || !target_fresh())) {
       tracking_active_ = false;
       RCLCPP_WARN(get_logger(), "tracking stopped; holding arm and ramping PX4 offset to zero");
     }
 
-    if (tracking_active_) {
+    if (trajectory_motion_active()) {
+      update_predefined_trajectory(dt);
+    } else if (tracking_active_) {
       if (!solve_target(dt)) tracking_active_ = false;
     }
-    if (!tracking_active_) ramp_flight_command_to_zero(dt);
+    if (!tracking_active_ && trajectory_phase_ == TrajectoryPhase::Idle) {
+      ramp_flight_command_to_zero(dt);
+    }
 
     publish_flight_command(dt);
     publish_arm_command();
@@ -593,6 +765,11 @@ class ChrController final : public rclcpp::Node {
   double maximum_yawrate_feedforward_{0.50};
   double maximum_accepted_position_residual_{0.03};
   double maximum_accepted_orientation_residual_{0.15};
+  double trajectory_init_tolerance_rad_{2.0 * kPi / 180.0};
+  double trajectory_init_settle_s_{0.5};
+  double trajectory_x_displacement_m_{0.50};
+  double trajectory_z_displacement_m_{-0.50};
+  double trajectory_frequency_hz_{0.03};
   bool publish_velocity_feedforward_{false};
   bool armed_{false};
   bool failsafe_{false};
@@ -606,12 +783,15 @@ class ChrController final : public rclcpp::Node {
   bool tracking_active_{false};
   bool origin_valid_{false};
   bool arm_command_initialized_{false};
+  bool trajectory_init_candidate_active_{false};
   bool state_published_{false};
   State state_{State::WaitingForFeedback};
+  TrajectoryPhase trajectory_phase_{TrajectoryPhase::Idle};
 
   std::vector<std::string> joint_names_;
-  std::vector<int32_t> flags_{0, 0, 0, 0, 0, 0};
+  std::vector<int32_t> flags_{0, 0, 0, 0, 0, 0, 0};
   Eigen::Vector3d maximum_joint_speed_{0.35, 0.20, 0.35};
+  JointVector trajectory_init_pose_{0.0, 3.0 * kPi / 180.0, 45.0 * kPi / 180.0};
   Eigen::Vector3d base_position_enu_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d base_velocity_enu_{Eigen::Vector3d::Zero()};
   Eigen::Quaterniond base_orientation_enu_{Eigen::Quaterniond::Identity()};
@@ -623,8 +803,10 @@ class ChrController final : public rclcpp::Node {
   double origin_yaw_enu_{0.0};
   Eigen::Vector3d base_offset_command_ned_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d previous_base_offset_command_ned_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d trajectory_base_origin_offset_ned_{Eigen::Vector3d::Zero()};
   double yaw_offset_command_ned_{0.0};
   double previous_yaw_offset_command_ned_{0.0};
+  double trajectory_hold_yaw_offset_ned_{0.0};
   IkOptions ik_options_;
   PoseIkResult last_ik_result_;
   std::unique_ptr<WholeBodyKinematics> kinematics_;
@@ -634,6 +816,8 @@ class ChrController final : public rclcpp::Node {
   SteadyClock::time_point last_joint_time_{};
   SteadyClock::time_point last_target_time_{};
   SteadyClock::time_point hover_candidate_since_{};
+  SteadyClock::time_point trajectory_init_candidate_since_{};
+  SteadyClock::time_point trajectory_start_time_{};
   SteadyClock::time_point last_step_time_{};
 
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odometry_sub_;

@@ -67,11 +67,6 @@ Vec2 quaternion_to_roll_pitch(const Quaternion &input) {
   return {roll, pitch};
 }
 
-double quintic_ramp(double elapsed, double duration) {
-  if (duration <= 1e-9) return 1.0;
-  const double x = std::clamp(elapsed / duration, 0.0, 1.0);
-  return 10.0 * x * x * x - 15.0 * x * x * x * x + 6.0 * x * x * x * x * x;
-}
 }  // namespace
 
 class KeyboardTeleop final : public rclcpp::Node {
@@ -79,7 +74,7 @@ class KeyboardTeleop final : public rclcpp::Node {
   KeyboardTeleop() : Node("keyboard_teleop_chr") {
     publish_rate_hz_ = declare_parameter("publish_rate_hz", 50.0);
     const bool dob_enabled_at_startup =
-      declare_parameter("dob_enabled_at_startup", true);
+      declare_parameter("dob_enabled_at_startup", false);
     const bool experiment_enabled_at_startup =
       declare_parameter("experiment_enabled_at_startup", true);
     flags_[0] = dob_enabled_at_startup ? 1 : 0;
@@ -88,26 +83,13 @@ class KeyboardTeleop final : public rclcpp::Node {
     rotation_step_rad_ = declare_parameter("rotation_step_deg", 3.0) * kPi / 180.0;
     workspace_min_ = vector_parameter("workspace_min", {-2.0, -2.0, 0.05});
     workspace_max_ = vector_parameter("workspace_max", {2.0, 2.0, 3.0});
-    trajectory_amplitude_ = vector_parameter(
-      "trajectory_amplitude_m", {0.04, 0.04, 0.02});
-    trajectory_base_frequency_hz_ = declare_parameter("trajectory_base_frequency_hz", 0.05);
-    trajectory_roll_amplitude_rad_ =
-      declare_parameter("trajectory_roll_amplitude_deg", 8.0) * kPi / 180.0;
-    trajectory_pitch_amplitude_rad_ =
-      declare_parameter("trajectory_pitch_amplitude_deg", 6.0) * kPi / 180.0;
-    trajectory_ramp_in_s_ = declare_parameter("trajectory_ramp_in_s", 3.0);
     if (publish_rate_hz_ <= 0.0 || translation_step_m_ <= 0.0 ||
-        rotation_step_rad_ <= 0.0 || trajectory_base_frequency_hz_ <= 0.0 ||
-        trajectory_roll_amplitude_rad_ < 0.0 || trajectory_pitch_amplitude_rad_ < 0.0 ||
-        trajectory_ramp_in_s_ < 0.0) {
+        rotation_step_rad_ <= 0.0) {
       throw std::runtime_error("teleop rates and steps must be positive");
     }
     for (std::size_t i = 0; i < 3; ++i) {
       if (workspace_min_[i] >= workspace_max_[i]) {
         throw std::runtime_error("workspace_min must be below workspace_max");
-      }
-      if (trajectory_amplitude_[i] < 0.0) {
-        throw std::runtime_error("trajectory_amplitude_m must be non-negative");
       }
     }
 
@@ -133,7 +115,7 @@ class KeyboardTeleop final : public rclcpp::Node {
     print_help();
     RCLCPP_WARN(
       get_logger(),
-      "startup defaults: DOB=%s, arm/DLS experiment=%s; M inhibits or re-enables tracking",
+      "startup defaults: DOB=%s, arm/trajectory experiment=%s; M inhibits or re-enables motion",
       flags_[0] ? "ON" : "OFF", flags_[5] ? "AUTO-ENABLE" : "OFF");
     RCLCPP_INFO(get_logger(), "waiting for /chr/state/tcp_pose before EE commands");
   }
@@ -181,7 +163,6 @@ class KeyboardTeleop final : public rclcpp::Node {
     measured_pose_.orientation = normalized(measured_pose_.orientation);
     if (target_reset_pending_ && SteadyClock::now() >= target_reset_not_before_) {
       target_pose_ = measured_pose_;
-      trajectory_center_ = measured_pose_;
       target_reset_pending_ = false;
       target_initialized_ = true;
       RCLCPP_WARN(get_logger(), "EE target reset from post-torque zeroed joint feedback");
@@ -210,14 +191,14 @@ class KeyboardTeleop final : public rclcpp::Node {
     if (flags_[5] && !flags_[1] && controller_state_ == "ARM_READY") {
       flags_[1] = 1;
       RCLCPP_WARN(
-        get_logger(), "ARM_READY received; Palletrone custom mode and DLS enabled automatically");
+        get_logger(),
+        "ARM_READY received; Palletrone custom mode enabled and predefined trajectory is ready");
     }
   }
 
   void update() {
     char key = 0;
     while (read(STDIN_FILENO, &key, 1) > 0) handle_key(key);
-    if (target_initialized_ && trajectory_enabled_) update_trajectory();
     if (target_initialized_) publish_target();
     publish_flags();
   }
@@ -227,17 +208,12 @@ class KeyboardTeleop final : public rclcpp::Node {
     if (key == 'b') { toggle_flag(0, "disturbance observer"); return; }
     if (key == 'm') { toggle_experiment(); return; }
     if (key == 'g') {
-      if (!target_initialized_) {
-        RCLCPP_WARN(get_logger(), "trajectory ignored until measured TCP pose arrives");
-        return;
-      }
       trajectory_enabled_ = !trajectory_enabled_;
       flags_[2] = trajectory_enabled_ ? 1 : 0;
-      if (trajectory_enabled_) {
-        trajectory_center_ = target_pose_;
-        trajectory_start_ = SteadyClock::now();
-      }
-      RCLCPP_WARN(get_logger(), "EE trajectory %s", trajectory_enabled_ ? "ON" : "OFF (hold)");
+      flags_[6] = 0;
+      RCLCPP_WARN(
+        get_logger(), "predefined arm-init/base-diagonal trajectory %s",
+        trajectory_enabled_ ? "ON" : "OFF (hold current command)");
       return;
     }
 
@@ -249,7 +225,7 @@ class KeyboardTeleop final : public rclcpp::Node {
     if (trajectory_enabled_) {
       trajectory_enabled_ = false;
       flags_[2] = 0;
-      RCLCPP_INFO(get_logger(), "trajectory stopped for manual EE command");
+      RCLCPP_INFO(get_logger(), "predefined trajectory stopped for manual EE command");
     }
     bool changed = true;
     switch (key) {
@@ -268,6 +244,7 @@ class KeyboardTeleop final : public rclcpp::Node {
       default: changed = false; break;
     }
     if (changed) {
+      flags_[6] = 1;
       clamp_position();
       print_target();
     }
@@ -285,31 +262,16 @@ class KeyboardTeleop final : public rclcpp::Node {
       flags_[1] = torque_enabled_ && controller_state_ == "ARM_READY" ? 1 : 0;
       RCLCPP_WARN(
         get_logger(),
-        "arm/DLS experiment = ON; waiting for arm torque and ARM_READY if needed");
+        "arm/trajectory experiment = ON; waiting for arm torque and ARM_READY if needed");
       return;
     }
     flags_[1] = 0;
     flags_[2] = 0;
+    flags_[6] = 0;
     trajectory_enabled_ = false;
     RCLCPP_WARN(
       get_logger(),
-      "arm/DLS experiment = OFF; DLS stopped, arm torque remains owned by the driver");
-  }
-
-  void update_trajectory() {
-    const double elapsed = std::chrono::duration<double>(
-      SteadyClock::now() - trajectory_start_).count();
-    const double ramp = quintic_ramp(elapsed, trajectory_ramp_in_s_);
-    target_pose_ = trajectory_center_;
-    const double phase = 2.0 * kPi * trajectory_base_frequency_hz_ * elapsed;
-    target_pose_.position.x += ramp * trajectory_amplitude_[0] * std::sin(phase);
-    target_pose_.position.y += ramp * trajectory_amplitude_[1] * std::sin(2.0 * phase);
-    target_pose_.position.z += ramp * trajectory_amplitude_[2] * std::sin(3.0 * phase);
-    const double roll = ramp * trajectory_roll_amplitude_rad_ * std::sin(2.0 * phase);
-    const double pitch = ramp * trajectory_pitch_amplitude_rad_ * std::sin(3.0 * phase);
-    target_pose_.orientation = product(
-      product(trajectory_center_.orientation, axis_angle(0, roll)), axis_angle(1, pitch));
-    clamp_position();
+      "arm/trajectory experiment = OFF; motion stopped, arm torque remains owned by the driver");
   }
 
   void rotate_local(int axis, double angle) {
@@ -354,23 +316,18 @@ class KeyboardTeleop final : public rclcpp::Node {
       " EE xyz: W/S +X/-X, A/D +Y/-Y, R/F +Z/-Z\n"
       " EE tilt: I/K +roll/-roll, J/L +pitch/-pitch (tool-z yaw is free)\n"
       " Space: hold measured EE, P: print target\n"
-      " G: xyz+roll/pitch Lissajous, B: DOB\n"
-      " M: emergency DLS inhibit/re-enable (arm torque is unchanged)\n"
-      " DLS auto-starts only after the controller reports ARM_READY.\n"
+      " G: configured arm-init then base X/Z diagonal motion; G again: hold\n"
+      " B: DOB, M: emergency motion inhibit/re-enable (arm torque is unchanged)\n"
+      " Motion starts only after the controller reports ARM_READY.\n"
       " Exit with Ctrl-C after M is OFF.");
   }
 
   double publish_rate_hz_{50.0};
   double translation_step_m_{0.01};
   double rotation_step_rad_{0.0523598776};
-  double trajectory_base_frequency_hz_{0.05};
-  double trajectory_roll_amplitude_rad_{0.1396263402};
-  double trajectory_pitch_amplitude_rad_{0.1047197551};
-  double trajectory_ramp_in_s_{3.0};
   Vec3 workspace_min_{-2.0, -2.0, 0.05};
   Vec3 workspace_max_{2.0, 2.0, 3.0};
-  Vec3 trajectory_amplitude_{0.04, 0.04, 0.02};
-  std::vector<int32_t> flags_{0, 0, 0, 0, 0, 0};
+  std::vector<int32_t> flags_{0, 0, 0, 0, 0, 0, 0};
   bool terminal_configured_{false};
   bool target_initialized_{false};
   bool trajectory_enabled_{false};
@@ -380,8 +337,6 @@ class KeyboardTeleop final : public rclcpp::Node {
   std::string controller_state_;
   geometry_msgs::msg::Pose measured_pose_;
   geometry_msgs::msg::Pose target_pose_;
-  geometry_msgs::msg::Pose trajectory_center_;
-  SteadyClock::time_point trajectory_start_{};
   SteadyClock::time_point target_reset_not_before_{};
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr flags_pub_;
