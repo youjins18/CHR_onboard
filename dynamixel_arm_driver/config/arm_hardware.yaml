@@ -2,7 +2,7 @@ dynamixel_arm_driver:
   ros__parameters:
     # Prefer /dev/serial/by-id/... on the flight computer. /dev/dynamixel is kept
     # as a compatible fallback for the already-installed udev rule.
-    usb_port: /dev/ttyUSB3
+    usb_port: /dev/ttyUSB1
     baudrate: 1000000
     protocol_version: 2.0
     publish_rate_hz: 100.0
@@ -13,8 +13,12 @@ dynamixel_arm_driver:
     joint_offset_rad: [0.0, 0.0, 0.0, 0.0]
 
     # J2 is intentionally restricted to 0--30 degrees for the temporary flight test.
-    joint_min_rad: [-1.5708, 0.0, -1.5708, -3.14159]
-    joint_max_rad: [1.5708, 0.5235987756, 1.5708, 3.14159]
+    #joint_min_rad: [-1.5708, 0.0, -1.5708, -3.14159]
+    #joint_max_rad: [1.5708, 0.5235987756, 1.5708, 3.14159]
+    joint_min_rad: [0.0, -1.5708, -1.5708, -3.14159]
+    # joint_max_rad: [0.5235987756, 1.5708, 1.5708, 3.14159]
+    joint_max_rad: [1.5708, 1.5708, 1.5708, 3.14159]
+
 
     torque_on_at_startup: false
     capture_zero_on_torque_enable: true

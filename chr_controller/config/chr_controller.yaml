@@ -19,19 +19,15 @@ chr_controller:
     maximum_accepted_orientation_residual_rad: 0.15
 
     joint_names: [J1, J2, J3]
-    joint_lower_rad: [-1.5708, 0.0, -1.5708]
-    joint_upper_rad: [1.5708, 0.5235987756, 1.5708]
+    joint_lower_rad: [0.0, -1.5708, -1.5708]
+    joint_upper_rad: [0.5235987756, 1.5708, 1.5708]
     maximum_joint_speed_rad_s: [1.00, 1.00, 1.00]
 
-    # G-key predefined trajectory (angles are relative to the airborne zero pose).
-    # 1) Move the arm to this pose and settle inside the tolerance.
-    # 2) Move the base smoothly from zero to [X, 0, Z] and back at one frequency.
-    trajectory_init_pose_deg: [0.0, 0.0, 45.0]
-    trajectory_init_tolerance_deg: 2.0
-    trajectory_init_settle_s: 0.5
+    # G-key base-only trajectory. The current manual arm command is held.
+    # Move the base smoothly from zero to [X, 0, Z] and back at one frequency.
     trajectory_x_displacement_m: 0.40
     trajectory_z_displacement_m: -0.40
-    trajectory_frequency_hz: 0.03
+    trajectory_frequency_hz: 0.05
 
     hover_linear_speed_threshold_m_s: 0.15
     hover_angular_speed_threshold_rad_s: 0.20

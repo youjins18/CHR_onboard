@@ -13,6 +13,7 @@
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/int32_multi_array.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -81,15 +82,26 @@ class KeyboardTeleop final : public rclcpp::Node {
     flags_[5] = experiment_enabled_at_startup ? 1 : 0;
     translation_step_m_ = declare_parameter("translation_step_m", 0.01);
     rotation_step_rad_ = declare_parameter("rotation_step_deg", 3.0) * kPi / 180.0;
+    joint_step_rad_ = declare_parameter("joint_step_deg", 3.0) * kPi / 180.0;
+    joint_names_ = declare_parameter<std::vector<std::string>>(
+      "joint_names", {"J1", "J2", "J3"});
+    joint_lower_ = vector_parameter("joint_lower_rad", {-1.5708, 0.0, -1.5708});
+    joint_upper_ = vector_parameter("joint_upper_rad", {1.5708, 0.5235987756, 1.5708});
     workspace_min_ = vector_parameter("workspace_min", {-2.0, -2.0, 0.05});
     workspace_max_ = vector_parameter("workspace_max", {2.0, 2.0, 3.0});
     if (publish_rate_hz_ <= 0.0 || translation_step_m_ <= 0.0 ||
-        rotation_step_rad_ <= 0.0) {
+        rotation_step_rad_ <= 0.0 || joint_step_rad_ <= 0.0) {
       throw std::runtime_error("teleop rates and steps must be positive");
+    }
+    if (joint_names_.size() != 3) {
+      throw std::runtime_error("joint_names must have three entries");
     }
     for (std::size_t i = 0; i < 3; ++i) {
       if (workspace_min_[i] >= workspace_max_[i]) {
         throw std::runtime_error("workspace_min must be below workspace_max");
+      }
+      if (joint_lower_[i] >= joint_upper_[i]) {
+        throw std::runtime_error("joint_lower_rad must be below joint_upper_rad");
       }
     }
 
@@ -97,6 +109,8 @@ class KeyboardTeleop final : public rclcpp::Node {
       "/chr/target/tcp_pose", 10);
     flags_pub_ = create_publisher<std_msgs::msg::Int32MultiArray>(
       "/control_mode_flags", 10);
+    manual_joint_pub_ = create_publisher<sensor_msgs::msg::JointState>(
+      "/chr/manual_joint_commands", 10);
     tcp_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       "/chr/state/tcp_pose", rclcpp::SensorDataQoS(),
       std::bind(&KeyboardTeleop::receive_tcp, this, std::placeholders::_1));
@@ -106,6 +120,9 @@ class KeyboardTeleop final : public rclcpp::Node {
     controller_state_sub_ = create_subscription<std_msgs::msg::String>(
       "/chr/controller_state", rclcpp::QoS(1).transient_local().reliable(),
       std::bind(&KeyboardTeleop::receive_controller_state, this, std::placeholders::_1));
+    joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
+      "/cone/joint_states", rclcpp::SensorDataQoS(),
+      std::bind(&KeyboardTeleop::receive_joint_state, this, std::placeholders::_1));
 
     configure_terminal();
     const auto period = std::chrono::duration<double>(1.0 / publish_rate_hz_);
@@ -115,9 +132,9 @@ class KeyboardTeleop final : public rclcpp::Node {
     print_help();
     RCLCPP_WARN(
       get_logger(),
-      "startup defaults: DOB=%s, arm/trajectory experiment=%s; M inhibits or re-enables motion",
-      flags_[0] ? "ON" : "OFF", flags_[5] ? "AUTO-ENABLE" : "OFF");
-    RCLCPP_INFO(get_logger(), "waiting for /chr/state/tcp_pose before EE commands");
+      "startup defaults: DOB=%s, arm/base experiment=%s; M inhibits or re-enables motion",
+      flags_[0] ? "ON" : "OFF", flags_[5] ? "ON" : "OFF");
+    RCLCPP_INFO(get_logger(), "waiting for /cone/joint_states before manual joint commands");
   }
 
   ~KeyboardTeleop() override { restore_terminal(); }
@@ -181,6 +198,7 @@ class KeyboardTeleop final : public rclcpp::Node {
     if (!rising_edge) return;
     trajectory_enabled_ = false;
     flags_[2] = 0;
+    manual_joint_initialized_ = false;
     target_reset_pending_ = true;
     target_reset_not_before_ = SteadyClock::now() + std::chrono::milliseconds(100);
     RCLCPP_WARN(get_logger(), "torque-on detected; waiting for post-zero joint feedback");
@@ -188,12 +206,28 @@ class KeyboardTeleop final : public rclcpp::Node {
 
   void receive_controller_state(const std_msgs::msg::String::SharedPtr message) {
     controller_state_ = message->data;
-    if (flags_[5] && !flags_[1] && controller_state_ == "ARM_READY") {
-      flags_[1] = 1;
-      RCLCPP_WARN(
-        get_logger(),
-        "ARM_READY received; Palletrone custom mode enabled and predefined trajectory is ready");
+  }
+
+  void receive_joint_state(const sensor_msgs::msg::JointState::SharedPtr message) {
+    if (manual_joint_initialized_) return;
+    Vec3 initial{0.0, 0.0, 0.0};
+    std::array<bool, 3> found{false, false, false};
+    for (std::size_t source = 0; source < message->name.size(); ++source) {
+      if (source >= message->position.size() || !std::isfinite(message->position[source])) continue;
+      for (std::size_t destination = 0; destination < joint_names_.size(); ++destination) {
+        if (message->name[source] == joint_names_[destination]) {
+          initial[destination] = message->position[source];
+          found[destination] = true;
+        }
+      }
     }
+    if (!std::all_of(found.begin(), found.end(), [](bool value) { return value; })) return;
+    for (std::size_t joint = 0; joint < 3; ++joint) {
+      manual_joint_command_[joint] = std::clamp(
+        initial[joint], joint_lower_[joint], joint_upper_[joint]);
+    }
+    manual_joint_initialized_ = true;
+    print_joint_command();
   }
 
   void update() {
@@ -209,13 +243,26 @@ class KeyboardTeleop final : public rclcpp::Node {
     if (key == 'm') { toggle_experiment(); return; }
     if (key == 'g') {
       trajectory_enabled_ = !trajectory_enabled_;
-      flags_[2] = trajectory_enabled_ ? 1 : 0;
+      if (trajectory_enabled_) {
+        flags_[5] = 1;
+        flags_[1] = 1;
+        flags_[2] = 1;
+      } else {
+        flags_[2] = 0;
+      }
       flags_[6] = 0;
       RCLCPP_WARN(
-        get_logger(), "predefined arm-init/base-diagonal trajectory %s",
-        trajectory_enabled_ ? "ON" : "OFF (hold current command)");
+        get_logger(), "base X/Z diagonal trajectory %s",
+        trajectory_enabled_ ? "ON (operator-authorized)" : "OFF (hold current command)");
       return;
     }
+
+    if (key == 'w') { adjust_joint(0, joint_step_rad_); return; }
+    if (key == 's') { adjust_joint(0, -joint_step_rad_); return; }
+    if (key == 'a') { adjust_joint(1, joint_step_rad_); return; }
+    if (key == 'd') { adjust_joint(1, -joint_step_rad_); return; }
+    if (key == 'i') { adjust_joint(2, joint_step_rad_); return; }
+    if (key == 'k') { adjust_joint(2, -joint_step_rad_); return; }
 
     if (!target_initialized_) {
       RCLCPP_WARN_THROTTLE(
@@ -229,14 +276,8 @@ class KeyboardTeleop final : public rclcpp::Node {
     }
     bool changed = true;
     switch (key) {
-      case 'w': target_pose_.position.x += translation_step_m_; break;
-      case 's': target_pose_.position.x -= translation_step_m_; break;
-      case 'a': target_pose_.position.y += translation_step_m_; break;
-      case 'd': target_pose_.position.y -= translation_step_m_; break;
       case 'r': target_pose_.position.z += translation_step_m_; break;
       case 'f': target_pose_.position.z -= translation_step_m_; break;
-      case 'i': rotate_local(0, rotation_step_rad_); break;
-      case 'k': rotate_local(0, -rotation_step_rad_); break;
       case 'j': rotate_local(1, rotation_step_rad_); break;
       case 'l': rotate_local(1, -rotation_step_rad_); break;
       case ' ': target_pose_ = measured_pose_; break;
@@ -253,6 +294,37 @@ class KeyboardTeleop final : public rclcpp::Node {
   void toggle_flag(std::size_t index, const char *label) {
     flags_[index] = flags_[index] ? 0 : 1;
     RCLCPP_WARN(get_logger(), "%s = %s", label, flags_[index] ? "ON" : "OFF");
+  }
+
+  void adjust_joint(std::size_t joint, double delta) {
+    if (!manual_joint_initialized_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "manual joint command ignored: waiting for J1/J2/J3 in /cone/joint_states");
+      return;
+    }
+    manual_joint_command_[joint] = std::clamp(
+      manual_joint_command_[joint] + delta, joint_lower_[joint], joint_upper_[joint]);
+    flags_[5] = 1;
+    flags_[6] = 0;
+    publish_manual_joint_command();
+    print_joint_command();
+  }
+
+  void publish_manual_joint_command() {
+    sensor_msgs::msg::JointState message;
+    message.header.stamp = now();
+    message.name = joint_names_;
+    message.position.assign(manual_joint_command_.begin(), manual_joint_command_.end());
+    manual_joint_pub_->publish(message);
+  }
+
+  void print_joint_command() const {
+    RCLCPP_INFO(
+      get_logger(), "manual joint command [deg] J1=%.1f J2=%.1f J3=%.1f",
+      manual_joint_command_[0] * 180.0 / kPi,
+      manual_joint_command_[1] * 180.0 / kPi,
+      manual_joint_command_[2] * 180.0 / kPi);
   }
 
   void toggle_experiment() {
@@ -313,18 +385,22 @@ class KeyboardTeleop final : public rclcpp::Node {
     RCLCPP_INFO(
       get_logger(),
       "\nCHR temporary experiment keyboard\n"
-      " EE xyz: W/S +X/-X, A/D +Y/-Y, R/F +Z/-Z\n"
-      " EE tilt: I/K +roll/-roll, J/L +pitch/-pitch (tool-z yaw is free)\n"
-      " Space: hold measured EE, P: print target\n"
-      " G: configured arm-init then base X/Z diagonal motion; G again: hold\n"
+      " Arm joints: W/S J1 +/-, A/D J2 +/-, I/K J3 +/-\n"
+      " Remaining EE/DLS keys: R/F Z +/-, J/L pitch +/-, Space reset, P print\n"
+      " G: base X/Z diagonal motion from current pose; G again: hold\n"
       " B: DOB, M: emergency motion inhibit/re-enable (arm torque is unchanged)\n"
-      " Motion starts only after the controller reports ARM_READY.\n"
+      " G is operator-authorized and does not wait for ARM_READY.\n"
       " Exit with Ctrl-C after M is OFF.");
   }
 
   double publish_rate_hz_{50.0};
   double translation_step_m_{0.01};
   double rotation_step_rad_{0.0523598776};
+  double joint_step_rad_{0.0523598776};
+  std::vector<std::string> joint_names_{"J1", "J2", "J3"};
+  Vec3 joint_lower_{-1.5708, 0.0, -1.5708};
+  Vec3 joint_upper_{1.5708, 0.5235987756, 1.5708};
+  Vec3 manual_joint_command_{0.0, 0.0, 0.0};
   Vec3 workspace_min_{-2.0, -2.0, 0.05};
   Vec3 workspace_max_{2.0, 2.0, 3.0};
   std::vector<int32_t> flags_{0, 0, 0, 0, 0, 0, 0};
@@ -333,6 +409,7 @@ class KeyboardTeleop final : public rclcpp::Node {
   bool trajectory_enabled_{false};
   bool torque_enabled_{false};
   bool target_reset_pending_{false};
+  bool manual_joint_initialized_{false};
   termios original_terminal_{};
   std::string controller_state_;
   geometry_msgs::msg::Pose measured_pose_;
@@ -340,9 +417,11 @@ class KeyboardTeleop final : public rclcpp::Node {
   SteadyClock::time_point target_reset_not_before_{};
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr flags_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr manual_joint_pub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr tcp_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr torque_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr controller_state_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 
