@@ -2,7 +2,7 @@ dynamixel_arm_driver:
   ros__parameters:
     # Prefer /dev/serial/by-id/... on the flight computer. /dev/dynamixel is kept
     # as a compatible fallback for the already-installed udev rule.
-    usb_port: /dev/ttyUSB1
+    usb_port: /dev/ttyUSB3
     baudrate: 1000000
     protocol_version: 2.0
     publish_rate_hz: 100.0

@@ -171,14 +171,14 @@ Flight bag과 CHR bag은 별도 파일이다. 각각 변환한다.
 
 ```bash
 cd ~/Desktop/chr_onboard_ws/src/data_logging
-python3 rosbag_to_csv.py bags/palletrone_rosbag2_YYYY_MM_DD-HH_MM_SS/
-python3 rosbag_to_csv.py bags/chr_rosbag2_YYYY_MM_DD-HH_MM_SS/
+python3 rosbag_to_csv.py bags/palletrone_rosbag2_2026_10_19-19_51_15/
+python3 rosbag_to_csv.py bags/chr_rosbag2_2026_10_19-19_51_18/
 ```
 
 파일 가져오기 
 ```bash
-scp palletrone@192.168.10.152:~/Desktop/chr_onboard_ws/src/data_logging/bags/chr_rosbag2_2026_10_15-15_04_04/chr_rosbag2_2026_10_15-15_04_04.csv ~/Desktop/chr_onboard_bags/
-scp palletrone@192.168.10.152:~/Desktop/chr_onboard_ws/src/data_logging/bags/palletrone_rosbag2_2026_10_15-15_03_34/palletrone_rosbag2_2026_10_15-15_03_34.csv ~/Desktop/chr_onboard_bags/
+scp palletrone@192.168.10.152:~/Desktop/chr_onboard_ws/src/data_logging/bags/chr_rosbag2_2026_10_19-19_51_18/chr_rosbag2_2026_10_19-19_51_18.csv ~/Desktop/chr_onboard_bags/
+scp palletrone@192.168.10.152:~/Desktop/chr_onboard_ws/src/data_logging/bags/palletrone_rosbag2_2026_10_19-19_51_15/palletrone_rosbag2_2026_10_19-19_51_15.csv ~/Desktop/chr_onboard_bags/
 ```
 
 - Flight CSV: `matlab/Palletrone_Decryptor.m`
