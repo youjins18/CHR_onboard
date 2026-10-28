@@ -51,12 +51,10 @@ float th1_cmd = 0.0;
 float th2_cmd = 0.0;
 float th3_cmd = 0.0;
 float th4_cmd = 0.0;
-float payload_angle_cmd = 0.f;
 uint32_t servo1_ang = 0;
 uint32_t servo2_ang = 0;
 uint32_t servo3_ang = 0;
 uint32_t servo4_ang = 0;
-uint32_t servo5_ang = 0;
 float amplitude = 0.5;
 //ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
 
@@ -151,7 +149,6 @@ void READWRITE_dynamixel()
   packetHandler->write4ByteTxRx(portHandler, 2, ADDR_GOAL_POSITION, RADIAN_TO_TICK(th2_cmd), nullptr);
   packetHandler->write4ByteTxRx(portHandler, 3, ADDR_GOAL_POSITION, RADIAN_TO_TICK(th3_cmd), nullptr);
   packetHandler->write4ByteTxRx(portHandler, 4, ADDR_GOAL_POSITION, RADIAN_TO_TICK(th4_cmd), nullptr);
-//   packetHandler->write4ByteTxRx(portHandler, 5, ADDR_GOAL_POSITION, RADIAN_TO_TICK(payload_angle_cmd), nullptr);
 
   // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
 
@@ -160,7 +157,6 @@ void READWRITE_dynamixel()
   packetHandler->read4ByteTxRx(portHandler,2,ADDR_PRESENT_POSITION,&servo2_ang,nullptr);
   packetHandler->read4ByteTxRx(portHandler,3,ADDR_PRESENT_POSITION,&servo3_ang,nullptr);
   packetHandler->read4ByteTxRx(portHandler,4,ADDR_PRESENT_POSITION,&servo4_ang,nullptr);
-//   packetHandler->read4ByteTxRx(portHandler,5,ADDR_PRESENT_POSITION,&servo5_ang,nullptr);
 
   //printf(" servo1_angle | %u\n servo2_angle | %u\n servo3_angle | %u\n servo4_angle | %u\n"
   //  ,servo1_ang,servo2_ang,servo3_ang,servo4_ang);
@@ -185,6 +181,7 @@ public:
 
                 _servo_angle_cmd_sub = this->create_subscription<std_msgs::msg::Float32MultiArray>("servo_angle_cmd", qos,
                 [this](const std_msgs::msg::Float32MultiArray::UniquePtr msg) {
+			if (msg->data.size() < 4) return;
 
                         // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
 
@@ -192,7 +189,6 @@ public:
                         th2_cmd = msg->data[1];
                         th3_cmd = msg->data[2];
                         th4_cmd = msg->data[3];
-			payload_angle_cmd = msg->data[4];
 
 
                 });
@@ -205,12 +201,11 @@ public:
 
 
                         std_msgs::msg::Float32MultiArray servo_angle;
-                        servo_angle.data.resize(5);
+                        servo_angle.data.resize(4);
                         servo_angle.data[0] = TICK_TO_RADIAN(servo1_ang);
                         servo_angle.data[1] = TICK_TO_RADIAN(servo2_ang);
                         servo_angle.data[2] = TICK_TO_RADIAN(servo3_ang);
                         servo_angle.data[3] = TICK_TO_RADIAN(servo4_ang);
-			servo_angle.data[4] = TICK_TO_RADIAN(servo5_ang);
 
 
                         // 퍼블리시

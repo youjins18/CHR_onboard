@@ -1,345 +1,367 @@
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
 
 #include <px4_msgs/msg/custom_command_position_mode.hpp>
 #include <px4_msgs/msg/custom_command_velocity_mode.hpp>
+#include <px4_msgs/msg/vehicle_odometry.hpp>
 
 #include <Eigen/Dense>
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
-#include <algorithm>  // std::clamp
+#include <cstdint>
 
 class TrajectoryPublisher : public rclcpp::Node
 {
 public:
   TrajectoryPublisher()
-  : Node("trajectory_publisher"),
-    dt_sim_(0.0)
+  : Node("trajectory_publisher")
   {
-    // ===================== Tunables =====================
-    timer_period_ = 0.005; // 200 Hz
+    mode1_z_displacement_ =
+      declare_parameter<double>("mode1_z_displacement_m", -0.40);
+    mode2_x_displacement_ =
+      declare_parameter<double>("mode2_x_displacement_m", 0.40);
+    mode2_z_displacement_ =
+      declare_parameter<double>("mode2_z_displacement_m", -0.40);
+    mode3_x_displacement_ =
+      declare_parameter<double>("mode3_x_displacement_m", 0.40);
+    trajectory_frequency_ =
+      declare_parameter<double>("trajectory_frequency_hz", 0.05);
+    j1_link_length_ = declare_parameter<double>("j1_link_length_m", 0.333);
 
-    // ✅ HARD-CODE trajectory type (choose ONE)
-    traj_type_ = TrajType::Lissajous;
-    // traj_type_ = TrajType::Circle;
+    command_position_.setZero();
+    command_velocity_.setZero();
 
-    // ramp durations
-    alpha_ramp_in_  = 3.0; // [s] ramp-in
-    beta_ramp_down_ = 3.0; // [s] ramp-down
-
-    yaw_fixed_ = 0.0;              // [rad]
-    vel_feedforward_flag_ = true; // set true if you want to publish vel FF
-
-    // ===================== Publishers =====================
-    cmd_pos_pub_ = this->create_publisher<px4_msgs::msg::CustomCommandPositionMode>(
+    command_position_pub_ =
+      create_publisher<px4_msgs::msg::CustomCommandPositionMode>(
       "/fmu/in/custom_command_position_mode", 10);
-
-    cmd_vel_pub_ = this->create_publisher<px4_msgs::msg::CustomCommandVelocityMode>(
+    command_velocity_pub_ =
+      create_publisher<px4_msgs::msg::CustomCommandVelocityMode>(
       "/fmu/in/custom_command_velocity_mode", 10);
 
-    // ===================== Subscriber =====================
     rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
-    auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 6), qos_profile);
+    auto qos = rclcpp::QoS(
+      rclcpp::QoSInitialization(qos_profile.history, 6), qos_profile);
 
-    flags_sub_ = this->create_subscription<std_msgs::msg::Int32MultiArray>(
+    flags_sub_ = create_subscription<std_msgs::msg::Int32MultiArray>(
       "control_mode_flags", qos,
-      std::bind(&TrajectoryPublisher::onFlags, this, std::placeholders::_1));
+      std::bind(&TrajectoryPublisher::receive_flags, this, std::placeholders::_1));
+    odometry_sub_ = create_subscription<px4_msgs::msg::VehicleOdometry>(
+      "/fmu/out/vehicle_odometry", qos,
+      std::bind(&TrajectoryPublisher::receive_odometry, this, std::placeholders::_1));
+    j1_angle_sub_ = create_subscription<std_msgs::msg::Float32>(
+      "j1_angle", qos,
+      std::bind(&TrajectoryPublisher::receive_j1_angle, this, std::placeholders::_1));
 
-    // ===================== State init =====================
-    command_position_.setZero(); // [x, y, z, yaw]
-    command_velocity_.setZero(); // [vx, vy, vz, yawrate]
-    trajectory_toggle_  = false;
-    ramp_down_active_   = false;
-    t_disable_          = 0.0;
-
-    // ===================== Timer =====================
-    timer_ = this->create_wall_timer(
+    mode_start_ = std::chrono::steady_clock::now();
+    timer_ = create_wall_timer(
       std::chrono::duration<double>(timer_period_),
-      std::bind(&TrajectoryPublisher::onTimer, this));
+      std::bind(&TrajectoryPublisher::update, this));
   }
 
 private:
-  // ====== Trajectory type ======
-  enum class TrajType : int {
-    Lissajous = 0,
-    Circle    = 1
+  static constexpr double kPi = 3.14159265358979323846;
+
+  enum class Mode {
+    Idle,
+    Legacy,
+    J1Swing,
+    Vertical,
+    Diagonal,
+    Horizontal,
+    Hold
   };
 
-  struct RefState {
-    double x{0}, y{0}, z{0};
-    double vx{0}, vy{0}, vz{0};
-    double yaw{0}, yawrate{0};
+  struct Reference {
+    double x{0.0};
+    double y{0.0};
+    double z{0.0};
+    double vx{0.0};
+    double vy{0.0};
+    double vz{0.0};
   };
 
-  // ----- Flags callback -----
-  void onFlags(const std_msgs::msg::Int32MultiArray::SharedPtr msg)
+  static double wrap_pi(double angle)
   {
-    // idx2 only (trajectory enable)
-    if (msg->data.size() < 3) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                           "control_mode_flags size < 3 (need at least idx2)");
-      return;
+    return std::atan2(std::sin(angle), std::cos(angle));
+  }
+
+  static double yaw_from_quaternion(const std::array<float, 4> &q)
+  {
+    return std::atan2(
+      2.0 * (q[0] * q[3] + q[1] * q[2]),
+      1.0 - 2.0 * (q[2] * q[2] + q[3] * q[3]));
+  }
+
+  Mode requested_mode(const std::vector<int32_t> &flags) const
+  {
+    if (flags.size() < 9 || flags[1] == 0) return Mode::Idle;
+    if (flags[2]) return Mode::Legacy;
+    if (flags[3]) return Mode::J1Swing;
+    if (flags[5]) return Mode::Vertical;
+    if (flags[6]) return Mode::Diagonal;
+    if (flags[7]) return Mode::Horizontal;
+    if (flags[8]) return Mode::Hold;
+    return Mode::Idle;
+  }
+
+  void receive_flags(const std_msgs::msg::Int32MultiArray::SharedPtr msg)
+  {
+    const bool custom_enabled = msg->data.size() >= 2 && msg->data[1] != 0;
+    const Mode next_mode = requested_mode(msg->data);
+
+    if (custom_enabled && !custom_enabled_) {
+      capture_custom_origin();
     }
 
-    const bool new_toggle = (msg->data[2] != 0);
+    custom_enabled_ = custom_enabled;
+    if (next_mode != mode_) {
+      mode_ = next_mode;
+      mode_start_ = std::chrono::steady_clock::now();
+      capture_mode_origin();
+      j1_reference_angle_ = j1_angle_;
+    }
 
-    if (new_toggle != trajectory_toggle_) {
-      trajectory_toggle_ = new_toggle;
-
-      if (trajectory_toggle_) {
-        // ON: reset time (keep your previous behavior)
-        dt_sim_ = 0.0;
-        ramp_down_active_ = false;
-      } else {
-        // OFF: start ramp-down
-        ramp_down_active_ = true;
-        t_disable_ = dt_sim_;
-      }
-
-      RCLCPP_INFO(get_logger(), "Trajectory %s (HARD-CODED type=%s)",
-                  trajectory_toggle_ ? "ENABLED" : "DISABLED",
-                  (traj_type_ == TrajType::Circle) ? "CIRCLE" : "LISSAJOUS");
+    if (!custom_enabled_) {
+      custom_origin_valid_ = false;
     }
   }
 
-  // ----- Main timer -----
-  void onTimer()
+  void receive_odometry(const px4_msgs::msg::VehicleOdometry::SharedPtr msg)
   {
-    dt_sim_ += timer_period_;
-
-    if (trajectory_toggle_) {
-      // ON: ramp-in
-      trajectory_generate(traj_type_,
-                          /*ramp_in_enable=*/true,
-                          /*alpha=*/alpha_ramp_in_,
-                          /*ramp_down=*/false,
-                          /*beta=*/0.0,
-                          /*td=*/0.0);
-
-    } else if (ramp_down_active_) {
-      // OFF: ramp-down
-      const double td = dt_sim_ - t_disable_;
-
-      if (td >= beta_ramp_down_) {
-        ramp_down_active_ = false;
-        command_position_.setZero();
-        command_velocity_.setZero();
-      } else {
-        trajectory_generate(traj_type_,
-                            /*ramp_in_enable=*/false,
-                            /*alpha=*/0.0,
-                            /*ramp_down=*/true,
-                            /*beta=*/beta_ramp_down_,
-                            /*td=*/td);
-      }
-
-    } else {
-      // fully off
-      command_position_.setZero();
-      command_velocity_.setZero();
+    if (msg->pose_frame != px4_msgs::msg::VehicleOdometry::POSE_FRAME_NED) return;
+    if (!std::isfinite(msg->position[0]) ||
+        !std::isfinite(msg->position[1]) ||
+        !std::isfinite(msg->position[2])) {
+      return;
     }
 
-    // ---------- publish position ----------
-    px4_msgs::msg::CustomCommandPositionMode msg_pos{};
-    msg_pos.timestamp = nowToUsec();
-    msg_pos.setpoint = {
+    odometry_position_ <<
+      msg->position[0], msg->position[1], msg->position[2];
+    odometry_yaw_ = yaw_from_quaternion(msg->q);
+    odometry_received_ = true;
+
+    if (custom_enabled_ && !custom_origin_valid_) {
+      capture_custom_origin();
+      capture_mode_origin();
+    }
+  }
+
+  void receive_j1_angle(const std_msgs::msg::Float32::SharedPtr msg)
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (j1_angle_received_) {
+      const double dt =
+        std::chrono::duration<double>(now - last_j1_angle_time_).count();
+      if (dt > 1.0e-6) {
+        j1_angular_velocity_ = (msg->data - j1_angle_) / dt;
+      }
+    }
+    j1_angle_ = msg->data;
+    j1_angle_received_ = true;
+    last_j1_angle_time_ = now;
+  }
+
+  void capture_custom_origin()
+  {
+    if (!odometry_received_) return;
+    custom_origin_position_ = odometry_position_;
+    custom_origin_yaw_ = odometry_yaw_;
+    custom_origin_valid_ = true;
+  }
+
+  void capture_mode_origin()
+  {
+    if (custom_origin_valid_ && odometry_received_) {
+      mode_origin_position_ = odometry_position_ - custom_origin_position_;
+      mode_origin_yaw_ = wrap_pi(odometry_yaw_ - custom_origin_yaw_);
+    } else {
+      mode_origin_position_ = command_position_.head<3>();
+      mode_origin_yaw_ = command_position_(3);
+    }
+  }
+
+  Reference legacy_reference(double time) const
+  {
+    constexpr double fx = 0.30;
+    constexpr double fy = 0.15;
+    constexpr double fz = 0.60;
+    constexpr double ax = -0.15;
+    constexpr double ay = 0.35;
+    constexpr double az = 0.15;
+
+    const double wx = 2.0 * kPi * fx;
+    const double wy = 2.0 * kPi * fy;
+    const double wz = 2.0 * kPi * fz;
+    const double ramp_time = 3.0;
+    const double tau = std::clamp(time / ramp_time, 0.0, 1.0);
+    const double tau2 = tau * tau;
+    const double tau3 = tau2 * tau;
+    const double tau4 = tau3 * tau;
+    const double tau5 = tau4 * tau;
+    const double scale = 10.0 * tau3 - 15.0 * tau4 + 6.0 * tau5;
+    const double scale_dot = time < ramp_time ?
+      (30.0 * tau2 - 60.0 * tau3 + 30.0 * tau4) / ramp_time : 0.0;
+
+    Reference reference;
+    const double x = ax * std::sin(wx * time);
+    const double y = ay * std::sin(wy * time);
+    const double z = 0.5 * az * (std::cos(wz * time) - 1.0);
+    const double vx = ax * wx * std::cos(wx * time);
+    const double vy = ay * wy * std::cos(wy * time);
+    const double vz = -0.5 * az * wz * std::sin(wz * time);
+
+    reference.x = scale * x;
+    reference.y = scale * y;
+    reference.z = scale * z;
+    reference.vx = scale * vx + scale_dot * x;
+    reference.vy = scale * vy + scale_dot * y;
+    reference.vz = scale * vz + scale_dot * z;
+    return reference;
+  }
+
+  Reference periodic_reference(Mode mode, double time) const
+  {
+    const double omega = 2.0 * kPi * trajectory_frequency_;
+    const double blend = 0.5 * (1.0 - std::cos(omega * time));
+    const double blend_dot = 0.5 * omega * std::sin(omega * time);
+
+    Reference reference;
+    if (mode == Mode::Vertical) {
+      reference.z = -mode1_z_displacement_ * blend;
+      reference.vz = -mode1_z_displacement_ * blend_dot;
+    } else if (mode == Mode::Diagonal) {
+      reference.x = mode2_x_displacement_ * blend;
+      reference.vx = mode2_x_displacement_ * blend_dot;
+      reference.z = -mode2_z_displacement_ * blend;
+      reference.vz = -mode2_z_displacement_ * blend_dot;
+    } else if (mode == Mode::Horizontal) {
+      reference.x = mode3_x_displacement_ * blend;
+      reference.vx = mode3_x_displacement_ * blend_dot;
+    }
+    return reference;
+  }
+
+  Reference j1_swing_reference() const
+  {
+    Reference reference;
+    reference.x = j1_link_length_ *
+      (std::sin(j1_reference_angle_) - std::sin(j1_angle_));
+    reference.z = j1_link_length_ *
+      (std::cos(j1_reference_angle_) - std::cos(j1_angle_));
+    reference.vx = -j1_link_length_ * std::cos(j1_angle_) *
+      j1_angular_velocity_;
+    reference.vz = j1_link_length_ * std::sin(j1_angle_) *
+      j1_angular_velocity_;
+    return reference;
+  }
+
+  void update()
+  {
+    const double elapsed = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - mode_start_).count();
+
+    Reference reference;
+    if (mode_ == Mode::Legacy) {
+      reference = legacy_reference(elapsed);
+      command_position_ <<
+        reference.x, reference.y, reference.z, 0.0;
+    } else if (mode_ == Mode::J1Swing) {
+      reference = j1_swing_reference();
+      command_position_ <<
+        mode_origin_position_.x() + reference.x,
+        mode_origin_position_.y(),
+        mode_origin_position_.z() + reference.z,
+        mode_origin_yaw_;
+    } else if (
+      mode_ == Mode::Vertical ||
+      mode_ == Mode::Diagonal ||
+      mode_ == Mode::Horizontal)
+    {
+      reference = periodic_reference(mode_, elapsed);
+      command_position_ <<
+        mode_origin_position_.x() + reference.x,
+        mode_origin_position_.y(),
+        mode_origin_position_.z() + reference.z,
+        mode_origin_yaw_;
+    } else if (mode_ == Mode::Hold) {
+      command_position_ <<
+        mode_origin_position_.x(),
+        mode_origin_position_.y(),
+        mode_origin_position_.z(),
+        mode_origin_yaw_;
+    } else {
+      command_position_.setZero();
+    }
+
+    command_velocity_ <<
+      reference.vx, reference.vy, reference.vz, 0.0;
+
+    px4_msgs::msg::CustomCommandPositionMode position;
+    position.timestamp = now_microseconds();
+    position.setpoint = {
       static_cast<float>(command_position_(0)),
       static_cast<float>(command_position_(1)),
       static_cast<float>(command_position_(2)),
-      static_cast<float>(command_position_(3))
-    };
-    cmd_pos_pub_->publish(msg_pos);
+      static_cast<float>(command_position_(3))};
+    command_position_pub_->publish(position);
 
-    // ---------- publish velocity feedforward ----------
-    px4_msgs::msg::CustomCommandVelocityMode msg_vel{};
-    msg_vel.timestamp = nowToUsec();
-    msg_vel.setpoint = {
+    px4_msgs::msg::CustomCommandVelocityMode velocity;
+    velocity.timestamp = position.timestamp;
+    velocity.setpoint = {
       static_cast<float>(command_velocity_(0)),
       static_cast<float>(command_velocity_(1)),
       static_cast<float>(command_velocity_(2)),
-      static_cast<float>(command_velocity_(3))
-    };
-    cmd_vel_pub_->publish(msg_vel);
+      static_cast<float>(command_velocity_(3))};
+    command_velocity_pub_->publish(velocity);
   }
 
-  // ===== Quintic smoothstep helper =====
-  static inline void smoothstep_quintic(double tau, double T, double &s, double &s_dot)
-  {
-    if (T <= 1e-9) {
-      s = 1.0;
-      s_dot = 0.0;
-      return;
-    }
-
-    const double t = std::clamp(tau / T, 0.0, 1.0);
-    const double t2 = t*t, t3 = t2*t, t4 = t3*t, t5 = t4*t;
-
-    // s = 10t^3 - 15t^4 + 6t^5
-    s = 10.0*t3 - 15.0*t4 + 6.0*t5;
-
-    // ds/dt = (30t^2 - 60t^3 + 30t^4) / T
-    s_dot = (30.0*t2 - 60.0*t3 + 30.0*t4) / T;
-  }
-
-  // ===== Reference generators =====
-  RefState make_ref_lissajous(double t) const
-  {
-    // ====== Tunables (Lissajous) ======
-    const double fx = 0.3;   // [Hz]
-    const double fy = 0.15;   // [Hz]
-    const double fz = 0.6;   // [Hz]
-
-    const double Ax = - 0.15;   // [m]
-    const double Ay = 0.35;   // [m]
-    const double Az = 0.15;   // [m]
-
-    RefState r{};
-
-    const double wx = 2.0 * M_PI * fx;
-    const double wy = 2.0 * M_PI * fy;
-
-    r.x  = Ax * std::sin(wx * t);
-    r.vx = Ax * wx * std::cos(wx * t);
-
-    r.y  = Ay * std::sin(wy * t);
-    r.vy = Ay * wy * std::cos(wy * t);
-
-    if (Az > 1e-9) {
-      const double wz = 2.0 * M_PI * fz;
-      r.z  = 0.5 * Az * (std::cos(wz * t) - 1.0);
-      r.vz = -0.5 * Az * wz * std::sin(wz * t);
-    } else {
-      r.z  = 0.0;
-      r.vz = 0.0;
-    }
-
-    r.yaw = yaw_fixed_;
-    r.yawrate = 0.0;
-    return r;
-  }
-
-  RefState make_ref_circle(double t) const
-  {
-    // ====== Tunables (Circle) ======
-    const double f  = 0.3;   // [Hz]
-    const double R  = 0.4;   // [m]
-    const double cx = 0.0;    // [m]
-    const double cy = 0.0;    // [m]
-    const double z0 = 0.0;    // [m]
-
-    RefState r{};
-    const double w = 2.0 * M_PI * f;
-
-    r.x  = cx + R * std::cos(w * t);
-    r.y  = -cy + R * std::sin(w * t);
-    r.z  = z0;
-
-    r.vx = -R * w * std::sin(w * t);
-    r.vy = -R * w * std::cos(w * t);
-    r.vz = 0.0;
-
-    r.yaw = yaw_fixed_;
-    r.yawrate = 0.0;
-    return r;
-  }
-
-  // ===== Common trajectory generator with ramp-in / ramp-down =====
-  void trajectory_generate(TrajType type,
-                           bool ramp_in_enable, double alpha,
-                           bool ramp_down, double beta, double td)
-  {
-    const double t = dt_sim_;
-
-    // 1) build reference
-    RefState ref{};
-    switch (type) {
-      case TrajType::Lissajous: ref = make_ref_lissajous(t); break;
-      case TrajType::Circle:    ref = make_ref_circle(t);   break;
-      default:                  ref = make_ref_lissajous(t); break;
-    }
-
-    // 2) ramp scale
-    double s = 1.0;
-    double s_dot = 0.0;
-
-    if (ramp_down) {
-      // ramp-down: 1 -> 0 using s = 1 - p
-      double p = 0.0, p_dot = 0.0;
-      smoothstep_quintic(td, beta, p, p_dot);
-      s = 1.0 - p;
-      s_dot = -p_dot;
-
-    } else if (ramp_in_enable) {
-      // ramp-in: 0 -> 1
-      if (t < alpha) {
-        smoothstep_quintic(t, alpha, s, s_dot);
-      } else {
-        s = 1.0;
-        s_dot = 0.0;
-      }
-    }
-
-    // 3) apply ramp with product rule
-    const double x  = s * ref.x;
-    const double y  = s * ref.y;
-    const double z  = s * ref.z;
-
-    const double vx = s * ref.vx + s_dot * ref.x;
-    const double vy = s * ref.vy + s_dot * ref.y;
-    const double vz = s * ref.vz + s_dot * ref.z;
-
-    // 4) command output
-    command_position_(0) = x;
-    command_position_(1) = y;
-    command_position_(2) = z;
-    command_position_(3) = ref.yaw;
-
-    if (vel_feedforward_flag_) {
-      command_velocity_(0) = vx;
-      command_velocity_(1) = vy;
-      command_velocity_(2) = vz;
-      command_velocity_(3) = ref.yawrate;
-    } else {
-      command_velocity_.setZero();
-    }
-  }
-
-  // ----- Utils -----
-  uint64_t nowToUsec() const
+  uint64_t now_microseconds() const
   {
     rclcpp::Clock steady_clock(RCL_STEADY_TIME);
-    const auto now = steady_clock.now();
-    return static_cast<uint64_t>(now.nanoseconds() / 1000ULL);
+    return static_cast<uint64_t>(steady_clock.now().nanoseconds() / 1000ULL);
   }
 
-  // ----- ROS Interfaces -----
-  rclcpp::Publisher<px4_msgs::msg::CustomCommandPositionMode>::SharedPtr cmd_pos_pub_;
-  rclcpp::Publisher<px4_msgs::msg::CustomCommandVelocityMode>::SharedPtr cmd_vel_pub_;
-  rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr flags_sub_;
-  rclcpp::TimerBase::SharedPtr timer_;
+  const double timer_period_{0.005};
+  double mode1_z_displacement_{-0.40};
+  double mode2_x_displacement_{0.40};
+  double mode2_z_displacement_{-0.40};
+  double mode3_x_displacement_{0.40};
+  double trajectory_frequency_{0.05};
+  double j1_link_length_{0.333};
 
-  // ----- State -----
-  double timer_period_{0.005};
-  double dt_sim_{0.0};
-  bool trajectory_toggle_{false};
-
+  Mode mode_{Mode::Idle};
+  bool custom_enabled_{false};
+  bool odometry_received_{false};
+  bool custom_origin_valid_{false};
+  bool j1_angle_received_{false};
+  double odometry_yaw_{0.0};
+  double custom_origin_yaw_{0.0};
+  double mode_origin_yaw_{0.0};
+  double j1_angle_{0.0};
+  double j1_reference_angle_{0.0};
+  double j1_angular_velocity_{0.0};
+  Eigen::Vector3d odometry_position_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d custom_origin_position_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d mode_origin_position_{Eigen::Vector3d::Zero()};
   Eigen::Vector4d command_position_{Eigen::Vector4d::Zero()};
   Eigen::Vector4d command_velocity_{Eigen::Vector4d::Zero()};
+  std::chrono::steady_clock::time_point mode_start_;
+  std::chrono::steady_clock::time_point last_j1_angle_time_;
 
-  bool   ramp_down_active_{false};
-  double t_disable_{0.0};
-
-  // ----- Tunables / Mode -----
-  TrajType traj_type_{TrajType::Lissajous};
-
-  double alpha_ramp_in_{3.0};
-  double beta_ramp_down_{3.0};
-
-  double yaw_fixed_{0.0};
-  bool   vel_feedforward_flag_{false};
+  rclcpp::Publisher<px4_msgs::msg::CustomCommandPositionMode>::SharedPtr
+    command_position_pub_;
+  rclcpp::Publisher<px4_msgs::msg::CustomCommandVelocityMode>::SharedPtr
+    command_velocity_pub_;
+  rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr flags_sub_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odometry_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr j1_angle_sub_;
+  rclcpp::TimerBase::SharedPtr timer_;
 };
 
-int main(int argc, char* argv[])
+int main(int argc, char *argv[])
 {
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<TrajectoryPublisher>());

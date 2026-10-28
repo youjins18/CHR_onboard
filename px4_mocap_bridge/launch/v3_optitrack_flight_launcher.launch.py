@@ -38,6 +38,7 @@ def generate_launch_description():
     bag_output_root = LaunchConfiguration('bag_output_root')
     bag_name = LaunchConfiguration('bag_name')
     record_bag = LaunchConfiguration('record_bag')
+    launch_custom_trajectory = LaunchConfiguration('launch_custom_trajectory')
     default_bag_root = str(
         Path.home() / 'Desktop' / 'chr_onboard_ws' / 'src' / 'data_logging' / 'bags'
     )
@@ -62,6 +63,11 @@ def generate_launch_description():
             description='Record the Palletrone flight and OptiTrack topics.',
         ),
         DeclareLaunchArgument(
+            'launch_custom_trajectory',
+            default_value='true',
+            description='Run the Palletrone trajectory publisher.',
+        ),
+        DeclareLaunchArgument(
             'bag_output_root',
             default_value=default_bag_root,
             description='Directory that receives the timestamped Palletrone bag.',
@@ -80,7 +86,7 @@ def generate_launch_description():
                 )
             ),
             launch_arguments={
-                'launch_custom_trajectory': 'false',
+                'launch_custom_trajectory': launch_custom_trajectory,
                 'record_bag': record_bag,
                 'bag_output_root': bag_output_root,
                 'bag_name': bag_name,

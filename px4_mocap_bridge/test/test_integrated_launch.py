@@ -43,7 +43,7 @@ def test_integrated_launch_forwards_optitrack_arguments():
     assert 'rigid_body_name' in string_values
 
 
-def test_integrated_launch_disables_legacy_trajectory_and_configures_flight_bag():
+def test_integrated_launch_enables_trajectory_and_configures_flight_bag():
     tree = _integrated_launch_tree()
     string_values = {
         node.value
@@ -52,7 +52,7 @@ def test_integrated_launch_disables_legacy_trajectory_and_configures_flight_bag(
     }
 
     assert 'launch_custom_trajectory' in string_values
-    assert 'false' in string_values
+    assert 'true' in string_values
     assert 'record_bag' in string_values
     assert 'bag_output_root' in string_values
     assert 'bag_name' in string_values

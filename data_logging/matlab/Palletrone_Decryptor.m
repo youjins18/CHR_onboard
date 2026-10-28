@@ -8,7 +8,7 @@ if nargin < 1 || strlength(string(csv_file)) == 0
 end
 
 data = readtable(csv_file, 'VariableNamingRule', 'preserve');
-[t, v] = array_topic(data, '/data_logging_msg', 93);
+[t, v] = array_topic(data, '/data_logging_msg', 91);
 
 position = v(:, 1:3);
 position_command = v(:, 4:6);
@@ -22,11 +22,11 @@ force_command = v(:, 25:27);
 torque_command = v(:, 28:30);
 dob_torque = v(:, 32:34);
 rotor_thrust = v(:, 35:38);
-servo = v(:, 39:43);
-servo_command = v(:, 44:48);
-acceleration = v(:, 49:51);
-acceleration_command = v(:, 52:54);
-motor_percent = 100 * max(0, min(1, v(:, 71:74)));
+servo = v(:, 39:42);
+servo_command = v(:, 43:46);
+acceleration = v(:, 47:49);
+acceleration_command = v(:, 50:52);
+motor_percent = 100 * max(0, min(1, v(:, 69:72)));
 
 figure('Name', 'Palletrone flight control', 'Color', 'w');
 tiledlayout(3, 3, 'TileSpacing', 'compact');
@@ -64,8 +64,8 @@ plot(t, rad2deg(servo), 'LineWidth', 1.0); hold on;
 set(gca, 'ColorOrderIndex', 1);
 plot(t, rad2deg(servo_command), '--', 'LineWidth', 1.0);
 ylabel('servo [deg]'); xlabel('time [s]'); grid on;
-legend('S1', 'S2', 'S3', 'S4', 'payload', ...
-    'S1 cmd', 'S2 cmd', 'S3 cmd', 'S4 cmd', 'payload cmd', 'Location', 'eastoutside');
+legend('S1', 'S2', 'S3', 'S4', ...
+    'S1 cmd', 'S2 cmd', 'S3 cmd', 'S4 cmd', 'Location', 'eastoutside');
 
 figure('Name', 'Palletrone motion and allocation', 'Color', 'w');
 tiledlayout(4, 3, 'TileSpacing', 'compact');
@@ -106,6 +106,14 @@ legend('f_1', 'f_2', 'f_3', 'f_4', 'Location', 'best');
 
 fprintf('Palletrone: %d samples, %.2f s, maximum motor output %.1f %%\n', ...
     size(v, 1), t(end) - t(1), max(motor_percent, [], 'all'));
+
+[j1_time, j1_angle] = scalar_topic(data, '/j1_angle');
+[j1_command_time, j1_command] = scalar_topic(data, '/j1_angle_command');
+figure('Name', 'J1 and bar', 'Color', 'w');
+plot(j1_time, rad2deg(j1_angle), 'LineWidth', 1.2); hold on;
+plot(j1_command_time, rad2deg(j1_command), '--', 'LineWidth', 1.2);
+xlabel('time [s]'); ylabel('J1 [deg]'); grid on;
+legend('measured', 'command', 'Location', 'best');
 end
 
 
@@ -124,4 +132,12 @@ for index = 0:width-1
     end
     values(:, index + 1) = data{mask, column};
 end
+end
+
+
+function [t, values] = scalar_topic(data, topic)
+mask = string(data.topic) == topic;
+if ~any(mask); error('Topic %s is absent from this CSV.', topic); end
+t = data.time_s(mask);
+values = data{mask, 'data'};
 end

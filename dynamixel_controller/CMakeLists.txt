@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(quadrotor_controller)
+project(dynamixel_controller)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -19,6 +19,16 @@ target_compile_features(dynamixel_fix PUBLIC c_std_99 cxx_std_17)
 ament_target_dependencies(dynamixel_fix rclcpp std_msgs dynamixel_sdk)
 
 install(TARGETS dynamixel_fix
+  DESTINATION lib/${PROJECT_NAME})
+
+add_executable(dynamixel_fix_with_arm src/dynamixel_fix_with_arm.cpp)
+target_include_directories(dynamixel_fix_with_arm PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(dynamixel_fix_with_arm PUBLIC c_std_99 cxx_std_17)
+ament_target_dependencies(dynamixel_fix_with_arm rclcpp std_msgs dynamixel_sdk)
+
+install(TARGETS dynamixel_fix_with_arm
   DESTINATION lib/${PROJECT_NAME})
 
 

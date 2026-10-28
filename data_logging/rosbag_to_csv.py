@@ -53,15 +53,20 @@ def rows(bag_path: Path, storage_id: str) -> Iterator[dict[str, Any]]:
             message_class = get_message(topic.type)
         except (AttributeError, ImportError, ModuleNotFoundError) as error:
             package = topic.type.split("/", maxsplit=1)[0]
-            raise RuntimeError(
-                f"cannot load {topic.type}; source the workspace that provides {package}"
-            ) from error
+            print(
+                f"WARNING: skipping unavailable topic {topic.name} ({topic.type}); "
+                f"source the workspace that provides {package} to export it\n  {error}",
+                file=sys.stderr,
+            )
+            continue
         topic_types[topic.name] = (topic.type, message_class)
 
     failed_topics: set[str] = set()
     first_timestamp = None
     while reader.has_next():
         topic, serialized, timestamp = reader.read_next()
+        if topic not in topic_types:
+            continue
         if first_timestamp is None:
             first_timestamp = timestamp
         type_name, message_class = topic_types[topic]

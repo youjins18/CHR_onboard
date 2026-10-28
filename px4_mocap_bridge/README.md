@@ -88,9 +88,8 @@ ros2 launch px4_mocap_bridge v3_optitrack_flight_launcher.launch.py \
 Agent와 Dynamixel 구동 프로그램은 기존 실행 방법을 그대로 사용하며 이 wrapper가
 자동으로 시작하지 않습니다.
 
-CHR 실험에서는 이 wrapper가 legacy `custom_trajectory_generation`을 비활성화합니다.
-따라서 이후 실행하는 `chr_controller`만 PX4 custom position/velocity 명령을
-발행합니다. Palletrone/OptiTrack bag은 기본적으로
+이 wrapper는 legacy `custom_trajectory_generation`을 기본적으로 비활성화합니다.
+Palletrone/OptiTrack bag은 기본적으로
 `~/Desktop/chr_onboard_ws/src/data_logging/bags/palletrone_rosbag2_...`에 기록됩니다.
 `record_bag`, `bag_output_root`, `bag_name` launch argument로 기록을 변경할 수
 있습니다.

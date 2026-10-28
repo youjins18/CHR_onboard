@@ -93,7 +93,7 @@ public:
 
 
 		// 초기화
-		for (int i = 0; i < 5; ++i) {
+		for (int i = 0; i < 4; ++i) {
 			lpf_th_[i].setButter2Lowpass(
 				static_cast<float>(servo_lpf_fc_hz_),
 				static_cast<float>(servo_lpf_fs_hz_));
@@ -237,6 +237,7 @@ public:
 
 		servo_angle_ros2_sub = this->create_subscription<std_msgs::msg::Float32MultiArray>("servo_angle", qos,
                 [this](const std_msgs::msg::Float32MultiArray::UniquePtr msg) {
+			if (msg->data.size() < 4) return;
                         // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
 			// ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
 
@@ -244,7 +245,6 @@ public:
 			th2_act = msg->data[1];
 			th3_act = msg->data[2];
 			th4_act = msg->data[3];
-			th5_act = msg->data[4];
                 });
 
 		center_of_mass_sub = this->create_subscription<px4_msgs::msg::CenterOfMass>("/fmu/out/center_of_mass", qos,
@@ -277,12 +277,12 @@ public:
 
 		custom_control_mode_sub = this->create_subscription<std_msgs::msg::Int32MultiArray>("control_mode_flags", qos,
                 [this](const std_msgs::msg::Int32MultiArray::UniquePtr msg) {
+			if (msg->data.size() < 5) return;
                         // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
                         // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
 			dob_flag = sanitize_int(msg->data[0]);
 			custom_mode_flag = sanitize_int(msg->data[1]);
 			trajectory_flag = sanitize_int(msg->data[2]);
-			payload_flag = sanitize_int(msg->data[3]);
 			l1_adaptive_flag = sanitize_int(msg->data[4]);
 	
 		});
@@ -443,8 +443,6 @@ public:
 			th3_cmd = clampf(th3_cmd, -kServoThetaMax, +kServoThetaMax);
 			th4_cmd = clampf(th4_cmd, -kServoThetaMax, +kServoThetaMax);
 
-			payload_angle_trajectory();
-
 			// th1_cmd..th4_cmd 계산 직후, 첫 루프 한정
 			static bool lpf_warmed = false;
 			if (!lpf_warmed) {
@@ -453,8 +451,6 @@ public:
 				lpf_th_[1].step(th2_cmd);
 				lpf_th_[2].step(th3_cmd);
 				lpf_th_[3].step(th4_cmd);
-				lpf_th_[4].step(payload_angle_command);
-
 			}
 			lpf_warmed = true;
 			}			
@@ -464,14 +460,12 @@ public:
 			th2_lpf_cmd = lpf_th_[1].step(th2_cmd);
 			th3_lpf_cmd = lpf_th_[2].step(th3_cmd);
 			th4_lpf_cmd = lpf_th_[3].step(th4_cmd);
-			payload_lpf_angle_command = lpf_th_[4].step(payload_angle_command);
 
 			// NaN 안전처리
 			if (std::isnan(th1_lpf_cmd)) th1_lpf_cmd = 0.f;
 			if (std::isnan(th2_lpf_cmd)) th2_lpf_cmd = 0.f;
 			if (std::isnan(th3_lpf_cmd)) th3_lpf_cmd = 0.f;
 			if (std::isnan(th4_lpf_cmd)) th4_lpf_cmd = 0.f;
-			if (std::isnan(payload_lpf_angle_command)) payload_lpf_angle_command = 0.f;
 
 			th1_lpf_cmd = clampf(th1_lpf_cmd, -kServoThetaMax, +kServoThetaMax);
 			th2_lpf_cmd = clampf(th2_lpf_cmd, -kServoThetaMax, +kServoThetaMax);
@@ -479,12 +473,11 @@ public:
 			th4_lpf_cmd = clampf(th4_lpf_cmd, -kServoThetaMax, +kServoThetaMax);
 
 			std_msgs::msg::Float32MultiArray servo_angle_command;
-		        servo_angle_command.data.resize(5);
+		        servo_angle_command.data.resize(4);
         		servo_angle_command.data[0] = th1_lpf_cmd;
 		        servo_angle_command.data[1] = th2_lpf_cmd;
 		        servo_angle_command.data[2] = th3_lpf_cmd;
 		        servo_angle_command.data[3] = th4_lpf_cmd;
-				servo_angle_command.data[4] = payload_lpf_angle_command;
 
 			// 퍼블리시
                         this->servo_angle_cmd_pub->publish(servo_angle_command);
@@ -544,13 +537,11 @@ public:
                 	if(th2_act < 0.001 && th2_act > -0.001){th2_act = 0.0;}
                	 	if(th3_act < 0.001 && th3_act > -0.001){th3_act = 0.0;}
                 	if(th4_act < 0.001 && th4_act > -0.001){th4_act = 0.0;}
-                	if(th5_act < 0.001 && th5_act > -0.001){th5_act = 0.0;}
 
 			servo_angle_msg.servo_angle[0] = th1_act;
 			servo_angle_msg.servo_angle[1] = th2_act;
 			servo_angle_msg.servo_angle[2] = th3_act;
 			servo_angle_msg.servo_angle[3] = th4_act;
-			servo_angle_msg.servo_angle[4] = th5_act;
 
                         this->servo_angle_px4_pub->publish(servo_angle_msg);
 
@@ -587,8 +578,8 @@ public:
 				tz_trim,
 				tx_dhat, ty_dhat, tz_dhat,
 			    	f1, f2, f3, f4,
-			    	th1_act, th2_act, th3_act, th4_act, th5_act,
-			    	th1_cmd, th2_cmd, th3_cmd, th4_cmd, payload_angle_command,
+				th1_act, th2_act, th3_act, th4_act,
+				th1_cmd, th2_cmd, th3_cmd, th4_cmd,
 				ax, ay, az,
 				ax_d, ay_d, az_d,
 				0, 0, 0,
@@ -628,7 +619,7 @@ public:
 private:
 
 	// --- Servo command LPF (for th1..th4) ---
-	Biquad lpf_th_[5];
+	Biquad lpf_th_[4];
 	bool   lpf_inited_{false};
 	double servo_lpf_fc_hz_{8.0};  // 파라미터로 설정
 	double servo_lpf_fs_hz_{100.0};  // 샘플링 주파수 Hz (여기서 고정)
@@ -637,9 +628,9 @@ private:
 	float tx_dhat = 0.f, ty_dhat = 0.f, tz_dhat = 0.f;
 	float f1 = 0.0f, f2 = 0.0f, f3 = 0.0f, f4 = 0.0f;
 	float pwm1 = 0.0f, pwm2 = 0.0f, pwm3 = 0.0f, pwm4 = 0.0f;
-	float th1_cmd = 0.0f, th2_cmd = 0.0f, th3_cmd = 0.0f, th4_cmd = 0.0f, th5_cmd;
+	float th1_cmd = 0.0f, th2_cmd = 0.0f, th3_cmd = 0.0f, th4_cmd = 0.0f;
 	float th1_lpf_cmd = 0.0f, th2_lpf_cmd = 0.0f, th3_lpf_cmd = 0.0f, th4_lpf_cmd = 0.0f;
-	float th1_act = 0.0f, th2_act = 0.0f, th3_act = 0.0f, th4_act = 0.0f, th5_act;
+	float th1_act = 0.0f, th2_act = 0.0f, th3_act = 0.0f, th4_act = 0.0f;
 
 	float px = 0.f, py = 0.f, pz = 0.f, qx = 0.f, qy = 0.f, qz = 0.f, qw = 0.f;
 	float vx = 0.f, vy = 0.f, vz = 0.f, rx = 0.f, ry = 0.f, rz = 0.f;
@@ -651,14 +642,10 @@ private:
 	float com_lpf_x = 0.f, com_lpf_y = 0.f, com_lpf_z = 0.f;
 	float com_update_x = 0.f, com_update_y = 0.f, com_update_z = 0.f;	
 
-	int dob_flag = 0; int custom_mode_flag = 0;	int trajectory_flag = 0; int payload_flag = 0; int l1_adaptive_flag = 0;
+	int dob_flag = 0; int custom_mode_flag = 0;	int trajectory_flag = 0; int l1_adaptive_flag = 0;
 	
 	float pos_PID_dt = 0.f, vel_PID_dt = 0.f, att_PID_dt = 0.f, rate_PID_dt = 0.f, allo_PID_dt = 0.f, dob_PID_dt = 0.f, com_PID_dt = 0.f;
 
-	float radian_command = 0.174533;
-	float payload_angle_command = 0.f;
-	float payload_lpf_angle_command = 0.f;
-	
 
 	// ===== L1 Adaptive status =====
 	float dhat_tau_l1[3]     = {0.f, 0.f, 0.f};
@@ -695,151 +682,6 @@ static inline float servoSinMax() {
                         if(thrust_command > 55.0){ thrust_command = 55.0;}
                         return thrust_command;
 	}
-
-
-
-void payload_angle_trajectory()
-{
-    constexpr float dt     = 0.01f;
-    constexpr float move_T = 20.0f;
-    constexpr float hold_T = 45.0f;
-
-    constexpr float boot_move_T = 10.0f;   // 부팅 시 0->180 10초
-
-    constexpr float deg2rad = 3.141592f / 180.0f;
-    constexpr float a0   = 0.0f   * deg2rad;
-    constexpr float a180 = 180.0f * deg2rad;
-
-    enum Phase : int {
-        BOOT_MOVE_0_TO_180 = 0,
-        MOVE_180_TO_0,
-        HOLD_0,
-        MOVE_0_TO_180,
-    };
-
-    static int   phase = BOOT_MOVE_0_TO_180;
-    static float t_in_phase = 0.0f;
-
-    static bool boot_done = false;   // 부팅 램프 완료 여부
-    static bool done_once = false;   // 시퀀스 1회 완료 여부
-
-    // ============================================================
-    // (0) BOOT 램프: payload_flag 무관하게 딱 1번 (0->180, 10s)
-    // ============================================================
-    if (!boot_done) {
-        const float start = a0;
-        const float end   = a180;
-        const float duration = (boot_move_T < 1e-6f) ? 1e-6f : boot_move_T;
-
-        t_in_phase += dt;
-        float s = t_in_phase / duration;
-        if (s > 1.0f) s = 1.0f;
-
-        const float target = start + (end - start) * s;
-
-        const float max_rate = fabsf(end - start) / duration;
-        const float max_step = max_rate * dt;
-
-        const float err = target - payload_angle_command;
-        if      (err >  max_step) payload_angle_command += max_step;
-        else if (err < -max_step) payload_angle_command -= max_step;
-        else                      payload_angle_command = target;
-
-        payload_angle_command = clampf(payload_angle_command, a0, a180);
-
-        if (t_in_phase >= duration) {
-            t_in_phase = 0.0f;
-            boot_done = true;
-            phase = MOVE_180_TO_0;   // 시퀀스 준비 상태
-            done_once = false;       // 안전하게 초기화
-            payload_angle_command = a180; // 부팅 종료 시 180에 확정
-        }
-        return;
-    }
-
-    // ============================================================
-    // (1) payload_flag == 0: 180도로 "천천히" 복귀 (점프 금지)
-    //     - 시퀀스 상태는 리셋해서 다음 ON에서 다시 1회 수행 가능
-    // ============================================================
-    if (payload_flag == 0) {
-
-        // 다음 ON 때 다시 1회 시퀀스 가능하도록 상태 리셋
-        phase = MOVE_180_TO_0;
-        t_in_phase = 0.0f;
-        done_once = false;
-
-        // ✅ 현재 각도에서 180으로 rate-limit 복귀
-        constexpr float return_T = 3.0f;  // <-- 180으로 돌아가는 시간(초). 원하는 값으로 조절
-        const float duration = (return_T < 1e-6f) ? 1e-6f : return_T;
-
-        const float target = a180;
-
-        const float max_rate = fabsf(a180 - a0) / duration;  // [rad/s]
-        const float max_step = max_rate * dt;                // [rad/step]
-
-        const float err = target - payload_angle_command;
-        if      (err >  max_step) payload_angle_command += max_step;
-        else if (err < -max_step) payload_angle_command -= max_step;
-        else                      payload_angle_command = target;
-
-        payload_angle_command = clampf(payload_angle_command, a0, a180);
-        return;
-    }
-
-    // ============================================================
-    // (2) payload_flag == 1: 1회 시퀀스 (180->0 -> hold -> 0->180)
-    // ============================================================
-    if (done_once) {
-        payload_angle_command = a180;   // 완료 후 180 고정
-        return;
-    }
-
-    float start = a0, end = a0, duration = move_T;
-
-    switch (phase) {
-    case MOVE_180_TO_0:
-        start = a180; end = a0;   duration = move_T;
-        break;
-    case HOLD_0:
-        start = a0;   end = a0;   duration = hold_T;
-        break;
-    case MOVE_0_TO_180:
-    default:
-        start = a0;   end = a180; duration = move_T;
-        break;
-    }
-
-    t_in_phase += dt;
-    if (duration < 1e-6f) duration = 1e-6f;
-
-    float s = t_in_phase / duration;
-    if (s > 1.0f) s = 1.0f;
-
-    const float target = start + (end - start) * s;
-
-    const float max_rate = fabsf(end - start) / duration;
-    const float max_step = max_rate * dt;
-
-    const float err = target - payload_angle_command;
-    if      (err >  max_step) payload_angle_command += max_step;
-    else if (err < -max_step) payload_angle_command -= max_step;
-    else                      payload_angle_command = target;
-
-    payload_angle_command = clampf(payload_angle_command, a0, a180);
-
-    // phase advance
-    if (t_in_phase >= duration) {
-        t_in_phase = 0.0f;
-
-        if (phase == MOVE_180_TO_0)      phase = HOLD_0;
-        else if (phase == HOLD_0)        phase = MOVE_0_TO_180;
-        else {
-            done_once = true;            // 1회 완료
-            payload_angle_command = a180;
-        }
-    }
-}
-
 
 // ㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡㅡ //
         
